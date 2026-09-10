@@ -1,6 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
+
+use crate::dex_format::{
+    DexHeader as Header, FieldId, MethodId, ProtoId, bytes_at as get_bytes, instruction_width,
+    read_field_ids, read_method_ids, read_proto_ids, read_string, read_strings, read_type_list,
+    read_types, read_uleb, u32_at,
+};
+
+#[cfg(test)]
+use crate::dex_format::decode_mutf8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReferenceKind {
@@ -37,34 +46,6 @@ impl Query {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Table {
-    size: u32,
-    offset: u32,
-    item_size: usize,
-}
-
-#[derive(Debug)]
-struct Header {
-    strings: Table,
-    types: Table,
-    fields: Table,
-    methods: Table,
-    classes: Table,
-}
-
-#[derive(Debug, Clone)]
-struct FieldId {
-    class_idx: u16,
-    name_idx: u32,
-}
-
-#[derive(Debug, Clone)]
-struct MethodId {
-    class_idx: u16,
-    name_idx: u32,
-}
-
-#[derive(Debug, Clone, Copy)]
 struct CodeItem {
     method_idx: u32,
     insns_offset: usize,
@@ -77,173 +58,29 @@ pub struct Dex<'a> {
     header: Header,
     strings: Vec<String>,
     types: Vec<u32>,
+    protos: Vec<ProtoId>,
     fields: Vec<FieldId>,
     methods: Vec<MethodId>,
     class_type_indices: Vec<u32>,
     code_items: Vec<CodeItem>,
 }
 
-fn get_bytes(data: &[u8], offset: usize, size: usize) -> Result<&[u8]> {
-    data.get(offset..offset.saturating_add(size))
-        .with_context(|| {
-            format!(
-                "DEX range 0x{offset:x}..0x{:x} is out of bounds",
-                offset + size
-            )
-        })
-}
-
-fn u16_at(data: &[u8], offset: usize) -> Result<u16> {
-    let bytes: [u8; 2] = get_bytes(data, offset, 2)?.try_into().unwrap();
-    Ok(u16::from_le_bytes(bytes))
-}
-
-fn u32_at(data: &[u8], offset: usize) -> Result<u32> {
-    let bytes: [u8; 4] = get_bytes(data, offset, 4)?.try_into().unwrap();
-    Ok(u32::from_le_bytes(bytes))
-}
-
-fn read_uleb128(data: &[u8], cursor: &mut usize) -> Result<u32> {
-    let mut value = 0u32;
-    for shift in (0..35).step_by(7) {
-        let byte = *data
-            .get(*cursor)
-            .with_context(|| format!("truncated ULEB128 at 0x{:x}", *cursor))?;
-        *cursor += 1;
-        value |= u32::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(value);
-        }
-    }
-    bail!("invalid ULEB128 value")
-}
-
-fn decode_mutf8(data: &[u8]) -> String {
-    let mut units = Vec::with_capacity(data.len());
-    let mut cursor = 0;
-    while cursor < data.len() {
-        let b0 = data[cursor];
-        if b0 & 0x80 == 0 {
-            units.push(u16::from(b0));
-            cursor += 1;
-        } else if b0 & 0xe0 == 0xc0 && cursor + 1 < data.len() {
-            let b1 = data[cursor + 1];
-            units.push((u16::from(b0 & 0x1f) << 6) | u16::from(b1 & 0x3f));
-            cursor += 2;
-        } else if b0 & 0xf0 == 0xe0 && cursor + 2 < data.len() {
-            let b1 = data[cursor + 1];
-            let b2 = data[cursor + 2];
-            units.push(
-                (u16::from(b0 & 0x0f) << 12) | (u16::from(b1 & 0x3f) << 6) | u16::from(b2 & 0x3f),
-            );
-            cursor += 3;
-        } else {
-            units.push(0xfffd);
-            cursor += 1;
-        }
-    }
-    String::from_utf16_lossy(&units)
-}
-
-impl Header {
-    fn parse(data: &[u8]) -> Result<Self> {
-        ensure!(data.len() >= 0x70, "DEX is shorter than its header");
-        ensure!(&data[..4] == b"dex\n", "invalid DEX magic");
-        ensure!(data[7] == 0, "invalid DEX version terminator");
-
-        let table = |size_offset, offset_offset, item_size| -> Result<Table> {
-            let result = Table {
-                size: u32_at(data, size_offset)?,
-                offset: u32_at(data, offset_offset)?,
-                item_size,
-            };
-            let start = result.offset as usize;
-            let bytes = result.size as usize * result.item_size;
-            get_bytes(data, start, bytes)?;
-            Ok(result)
-        };
-        Ok(Self {
-            strings: table(0x38, 0x3c, 4)?,
-            types: table(0x40, 0x44, 4)?,
-            fields: table(0x50, 0x54, 8)?,
-            methods: table(0x58, 0x5c, 8)?,
-            classes: table(0x60, 0x64, 32)?,
-        })
-    }
-}
-
 impl<'a> Dex<'a> {
     pub fn parse(data: &'a [u8]) -> Result<Self> {
         let header = Header::parse(data)?;
+        let strings = read_strings(data, &header)?;
+        let types = read_types(data, &header)?;
+        let protos = read_proto_ids(data, &header)?;
+        let fields = read_field_ids(data, &header)?;
+        let methods = read_method_ids(data, &header)?;
 
-        let mut strings = Vec::with_capacity(header.strings.size as usize);
-        for index in 0..header.strings.size as usize {
-            let id_offset = header.strings.offset as usize + index * 4;
-            let mut cursor = u32_at(data, id_offset)? as usize;
-            let _utf16_size = read_uleb128(data, &mut cursor)?;
-            let end = data[cursor..]
-                .iter()
-                .position(|&byte| byte == 0)
-                .map(|length| cursor + length)
-                .with_context(|| format!("unterminated DEX string #{index}"))?;
-            strings.push(decode_mutf8(&data[cursor..end]));
-        }
-
-        let mut types = Vec::with_capacity(header.types.size as usize);
-        for index in 0..header.types.size as usize {
-            let string_idx = u32_at(data, header.types.offset as usize + index * 4)?;
-            ensure!(
-                string_idx < header.strings.size,
-                "type #{index} has invalid string index"
-            );
-            types.push(string_idx);
-        }
-
-        let mut fields = Vec::with_capacity(header.fields.size as usize);
-        for index in 0..header.fields.size as usize {
-            let offset = header.fields.offset as usize + index * 8;
-            let class_idx = u16_at(data, offset)?;
-            let name_idx = u32_at(data, offset + 4)?;
-            ensure!(
-                u32::from(class_idx) < header.types.size,
-                "field #{index} has invalid class index"
-            );
-            ensure!(
-                name_idx < header.strings.size,
-                "field #{index} has invalid name index"
-            );
-            fields.push(FieldId {
-                class_idx,
-                name_idx,
-            });
-        }
-
-        let mut methods = Vec::with_capacity(header.methods.size as usize);
-        for index in 0..header.methods.size as usize {
-            let offset = header.methods.offset as usize + index * 8;
-            let class_idx = u16_at(data, offset)?;
-            let name_idx = u32_at(data, offset + 4)?;
-            ensure!(
-                u32::from(class_idx) < header.types.size,
-                "method #{index} has invalid class index"
-            );
-            ensure!(
-                name_idx < header.strings.size,
-                "method #{index} has invalid name index"
-            );
-            methods.push(MethodId {
-                class_idx,
-                name_idx,
-            });
-        }
-
-        let mut class_type_indices = Vec::with_capacity(header.classes.size as usize);
-        let mut class_data_offsets = Vec::with_capacity(header.classes.size as usize);
-        for index in 0..header.classes.size as usize {
-            let offset = header.classes.offset as usize + index * 32;
+        let mut class_type_indices = Vec::with_capacity(header.class_defs_size as usize);
+        let mut class_data_offsets = Vec::with_capacity(header.class_defs_size as usize);
+        for index in 0..header.class_defs_size as usize {
+            let offset = header.class_defs_off as usize + index * 32;
             let class_idx = u32_at(data, offset)?;
             ensure!(
-                class_idx < header.types.size,
+                class_idx < header.type_ids_size,
                 "class #{index} has invalid type index"
             );
             class_type_indices.push(class_idx);
@@ -255,6 +92,7 @@ impl<'a> Dex<'a> {
             header,
             strings,
             types,
+            protos,
             fields,
             methods,
             class_type_indices,
@@ -270,26 +108,26 @@ impl<'a> Dex<'a> {
 
     fn parse_class_data(&mut self, offset: usize) -> Result<()> {
         let mut cursor = offset;
-        let static_fields = read_uleb128(self.data, &mut cursor)?;
-        let instance_fields = read_uleb128(self.data, &mut cursor)?;
-        let direct_methods = read_uleb128(self.data, &mut cursor)?;
-        let virtual_methods = read_uleb128(self.data, &mut cursor)?;
+        let static_fields = read_uleb(self.data, &mut cursor)?;
+        let instance_fields = read_uleb(self.data, &mut cursor)?;
+        let direct_methods = read_uleb(self.data, &mut cursor)?;
+        let virtual_methods = read_uleb(self.data, &mut cursor)?;
 
         for _ in 0..static_fields + instance_fields {
-            let _field_idx_diff = read_uleb128(self.data, &mut cursor)?;
-            let _access_flags = read_uleb128(self.data, &mut cursor)?;
+            let _field_idx_diff = read_uleb(self.data, &mut cursor)?;
+            let _access_flags = read_uleb(self.data, &mut cursor)?;
         }
 
         for count in [direct_methods, virtual_methods] {
             let mut method_idx = 0u32;
             for _ in 0..count {
                 method_idx = method_idx
-                    .checked_add(read_uleb128(self.data, &mut cursor)?)
+                    .checked_add(read_uleb(self.data, &mut cursor)?)
                     .context("method index overflow in class_data_item")?;
-                let _access_flags = read_uleb128(self.data, &mut cursor)?;
-                let code_offset = read_uleb128(self.data, &mut cursor)? as usize;
+                let _access_flags = read_uleb(self.data, &mut cursor)?;
+                let code_offset = read_uleb(self.data, &mut cursor)? as usize;
                 ensure!(
-                    method_idx < self.header.methods.size,
+                    method_idx < self.header.method_ids_size,
                     "invalid encoded method index"
                 );
                 if code_offset == 0 {
@@ -378,12 +216,12 @@ impl<'a> Dex<'a> {
         name_matches && class_matches
     }
 
-    pub fn scan_references(
+    pub fn scan_reference_sites(
         &self,
         kind: ReferenceKind,
         targets: &HashSet<u32>,
-    ) -> Result<BTreeMap<u32, BTreeSet<u32>>> {
-        let mut results: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+    ) -> Result<Vec<ReferenceSite>> {
+        let mut results = Vec::new();
         if targets.is_empty() {
             return Ok(results);
         }
@@ -399,7 +237,11 @@ impl<'a> Dex<'a> {
                 if let Some(index) = reference_index(kind, opcode, &units, pc)
                     && targets.contains(&index)
                 {
-                    results.entry(code.method_idx).or_default().insert(index);
+                    results.push(ReferenceSite {
+                        caller_index: code.method_idx,
+                        target_index: index,
+                        code_unit_offset: pc as u32,
+                    });
                 }
                 let width = instruction_width(&units, pc)?;
                 ensure!(
@@ -412,30 +254,113 @@ impl<'a> Dex<'a> {
         Ok(results)
     }
 
+    pub fn scan_references(
+        &self,
+        kind: ReferenceKind,
+        targets: &HashSet<u32>,
+    ) -> Result<BTreeMap<u32, BTreeSet<u32>>> {
+        let mut grouped = BTreeMap::<u32, BTreeSet<u32>>::new();
+        for site in self.scan_reference_sites(kind, targets)? {
+            grouped
+                .entry(site.caller_index)
+                .or_default()
+                .insert(site.target_index);
+        }
+        Ok(grouped)
+    }
+
     pub fn format_method(&self, index: u32) -> String {
-        let method = &self.methods[index as usize];
-        format!(
-            "{}->{}",
+        self.try_format_method(index)
+            .unwrap_or_else(|_| format!("method@{index}"))
+    }
+
+    pub fn try_format_method(&self, index: u32) -> Result<String> {
+        let method = self
+            .methods
+            .get(index as usize)
+            .with_context(|| format!("invalid method index {index}"))?;
+        let proto = self
+            .protos
+            .get(method.proto_idx as usize)
+            .with_context(|| format!("invalid proto index {}", method.proto_idx))?;
+        let parameters =
+            read_type_list(self.data, proto.parameters_off, self.header.type_ids_size)?
+                .into_iter()
+                .map(|type_idx| self.type_descriptor(u32::from(type_idx)))
+                .collect::<String>();
+        Ok(format!(
+            "{}->{}({}){}",
             self.type_descriptor(u32::from(method.class_idx)),
-            self.strings[method.name_idx as usize]
-        )
+            self.strings[method.name_idx as usize],
+            parameters,
+            self.type_descriptor(proto.return_type_idx)
+        ))
     }
 
     pub fn format_match(&self, kind: ReferenceKind, index: u32) -> String {
+        self.try_format_match(kind, index)
+            .unwrap_or_else(|_| format!("{}@{index}", kind.label()))
+    }
+
+    pub fn try_format_match(&self, kind: ReferenceKind, index: u32) -> Result<String> {
         match kind {
-            ReferenceKind::String => self.strings[index as usize].clone(),
-            ReferenceKind::Type => self.type_descriptor(index).to_owned(),
-            ReferenceKind::Method => self.format_method(index),
+            ReferenceKind::String => self
+                .strings
+                .get(index as usize)
+                .cloned()
+                .with_context(|| format!("invalid string index {index}")),
+            ReferenceKind::Type => Ok(self.type_descriptor(index).to_owned()),
+            ReferenceKind::Method => self.try_format_method(index),
             ReferenceKind::Field => {
-                let field = &self.fields[index as usize];
-                format!(
-                    "{}->{}",
+                let field = self
+                    .fields
+                    .get(index as usize)
+                    .with_context(|| format!("invalid field index {index}"))?;
+                Ok(format!(
+                    "{}->{}:{}",
                     self.type_descriptor(u32::from(field.class_idx)),
-                    self.strings[field.name_idx as usize]
-                )
+                    self.strings[field.name_idx as usize],
+                    self.type_descriptor(u32::from(field.type_idx))
+                ))
             }
         }
     }
+}
+
+impl ReferenceKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Type => "type",
+            Self::Method => "method",
+            Self::Field => "field",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReferenceSite {
+    pub caller_index: u32,
+    pub target_index: u32,
+    /// Offset from the beginning of the caller's instruction stream, measured
+    /// in 16-bit DEX code units.
+    pub code_unit_offset: u32,
+}
+
+/// Read only the tables required to index class definitions. This avoids
+/// walking every method and code item when locating one class in a multidex APK.
+pub fn class_descriptors(data: &[u8]) -> Result<Vec<String>> {
+    let header = Header::parse(data)?;
+    let types = read_types(data, &header)?;
+    let mut result = Vec::with_capacity(header.class_defs_size as usize);
+    for index in 0..header.class_defs_size as usize {
+        let class_idx = u32_at(data, header.class_defs_off as usize + index * 32)?;
+        let string_idx = *types
+            .get(class_idx as usize)
+            .with_context(|| format!("class #{index} has invalid type index"))?;
+        result.push(read_string(data, &header, string_idx as usize)?);
+    }
+    Ok(result)
 }
 
 fn reference_index(kind: ReferenceKind, opcode: u8, units: &[u16], pc: usize) -> Option<u32> {
@@ -452,88 +377,6 @@ fn reference_index(kind: ReferenceKind, opcode: u8, units: &[u16], pc: usize) ->
         }
         _ => None,
     }
-}
-
-fn instruction_width(units: &[u16], pc: usize) -> Result<usize> {
-    let unit = *units.get(pc).context("instruction starts past code item")?;
-    let opcode = (unit & 0xff) as u8;
-    if opcode == 0 {
-        return match unit >> 8 {
-            0 => Ok(1),
-            1 => {
-                let size = usize::from(
-                    *units
-                        .get(pc + 1)
-                        .context("truncated packed-switch payload")?,
-                );
-                Ok(4 + size * 2)
-            }
-            2 => {
-                let size = usize::from(
-                    *units
-                        .get(pc + 1)
-                        .context("truncated sparse-switch payload")?,
-                );
-                Ok(2 + size * 4)
-            }
-            3 => {
-                let element_width =
-                    usize::from(*units.get(pc + 1).context("truncated fill-array payload")?);
-                let low = u32::from(*units.get(pc + 2).context("truncated fill-array payload")?);
-                let high = u32::from(*units.get(pc + 3).context("truncated fill-array payload")?);
-                let size =
-                    usize::try_from(low | (high << 16)).context("fill-array size overflow")?;
-                Ok(4 + element_width.saturating_mul(size).div_ceil(2))
-            }
-            ident => bail!("unknown DEX payload identifier 0x{ident:02x}"),
-        };
-    }
-
-    let width = match opcode {
-        0x01
-        | 0x04
-        | 0x07
-        | 0x0a..=0x12
-        | 0x1d..=0x1e
-        | 0x21
-        | 0x27..=0x28
-        | 0x3e..=0x43
-        | 0x73
-        | 0x79..=0x8f
-        | 0xb0..=0xcf
-        | 0xe3..=0xf9 => 1,
-        0x02
-        | 0x05
-        | 0x08
-        | 0x13
-        | 0x15..=0x16
-        | 0x19..=0x1a
-        | 0x1c
-        | 0x1f..=0x20
-        | 0x22..=0x23
-        | 0x29
-        | 0x2d..=0x3d
-        | 0x44..=0x6d
-        | 0x90..=0xaf
-        | 0xd0..=0xe2
-        | 0xfe..=0xff => 2,
-        0x03
-        | 0x06
-        | 0x09
-        | 0x14
-        | 0x17
-        | 0x1b
-        | 0x24..=0x26
-        | 0x2a..=0x2c
-        | 0x6e..=0x72
-        | 0x74..=0x78
-        | 0xfc..=0xfd => 3,
-        0xfa..=0xfb => 4,
-        0x18 => 5,
-        // opcode 0 is handled above, including payload pseudo-instructions.
-        0x00 => unreachable!(),
-    };
-    Ok(width)
 }
 
 #[cfg(test)]

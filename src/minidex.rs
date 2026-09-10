@@ -8,44 +8,13 @@ use anyhow::{Context, Result, bail, ensure};
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use crate::dex_format::{
+    DexHeader as Header, FieldId, MethodId, ProtoId, bytes_at, instruction_width, read_field_ids,
+    read_method_ids, read_proto_ids, read_strings, read_type_list, read_types, read_uleb, u16_at,
+    u32_at, utf16_cmp,
+};
+
 const NO_INDEX: u32 = u32::MAX;
-
-#[derive(Debug, Clone, Copy)]
-struct Header {
-    string_ids_size: u32,
-    string_ids_off: u32,
-    type_ids_size: u32,
-    type_ids_off: u32,
-    proto_ids_size: u32,
-    proto_ids_off: u32,
-    field_ids_size: u32,
-    field_ids_off: u32,
-    method_ids_size: u32,
-    method_ids_off: u32,
-    class_defs_size: u32,
-    class_defs_off: u32,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ProtoId {
-    shorty_idx: u32,
-    return_type_idx: u32,
-    parameters_off: u32,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct FieldId {
-    class_idx: u16,
-    type_idx: u16,
-    name_idx: u32,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct MethodId {
-    class_idx: u16,
-    proto_idx: u16,
-    name_idx: u32,
-}
 
 #[derive(Debug, Clone, Copy)]
 struct ClassDef {
@@ -160,10 +129,25 @@ struct DebugInfo {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IndexKind {
+    Proto,
     String,
     Type,
     Field,
+    Enum,
     Method,
+}
+
+impl IndexKind {
+    fn encoded_value_type(self) -> u8 {
+        match self {
+            Self::Proto => 0x15,
+            Self::String => 0x17,
+            Self::Type => 0x18,
+            Self::Field => 0x19,
+            Self::Method => 0x1a,
+            Self::Enum => 0x1b,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -193,21 +177,21 @@ struct BytecodeRefs {
     methods: OrderedIds,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct NewProto {
     shorty_idx: u32,
     return_type_idx: u32,
     params: Vec<u16>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NewField {
     class_idx: u16,
     type_idx: u16,
     name_idx: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NewMethod {
     class_idx: u16,
     proto_idx: u16,
@@ -223,43 +207,6 @@ struct DexView<'a> {
     protos: Vec<ProtoId>,
     fields: Vec<FieldId>,
     methods: Vec<MethodId>,
-}
-
-fn bytes_at(data: &[u8], offset: usize, size: usize) -> Result<&[u8]> {
-    data.get(offset..offset.saturating_add(size))
-        .with_context(|| {
-            format!(
-                "DEX range 0x{offset:x}..0x{:x} is out of bounds",
-                offset + size
-            )
-        })
-}
-
-fn u16_at(data: &[u8], offset: usize) -> Result<u16> {
-    Ok(u16::from_le_bytes(
-        bytes_at(data, offset, 2)?.try_into().unwrap(),
-    ))
-}
-
-fn u32_at(data: &[u8], offset: usize) -> Result<u32> {
-    Ok(u32::from_le_bytes(
-        bytes_at(data, offset, 4)?.try_into().unwrap(),
-    ))
-}
-
-fn read_uleb(data: &[u8], cursor: &mut usize) -> Result<u32> {
-    let mut value = 0u32;
-    for shift in (0..35).step_by(7) {
-        let byte = *data
-            .get(*cursor)
-            .with_context(|| format!("truncated ULEB128 at 0x{:x}", *cursor))?;
-        *cursor += 1;
-        value |= u32::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(value);
-        }
-    }
-    bail!("invalid ULEB128")
 }
 
 fn read_sleb(data: &[u8], cursor: &mut usize) -> Result<i32> {
@@ -321,36 +268,24 @@ fn patch_u32(out: &mut [u8], offset: usize, value: u32) {
     out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+fn patch_u16(out: &mut [u8], offset: usize, value: u16) {
+    out[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
 fn align4(out: &mut Vec<u8>) {
     while out.len() & 3 != 0 {
         out.push(0);
     }
 }
 
-fn decode_mutf8(data: &[u8]) -> String {
-    let mut units = Vec::with_capacity(data.len());
-    let mut cursor = 0;
-    while cursor < data.len() {
-        let b0 = data[cursor];
-        if b0 & 0x80 == 0 {
-            units.push(u16::from(b0));
-            cursor += 1;
-        } else if b0 & 0xe0 == 0xc0 && cursor + 1 < data.len() {
-            units.push((u16::from(b0 & 0x1f) << 6) | u16::from(data[cursor + 1] & 0x3f));
-            cursor += 2;
-        } else if b0 & 0xf0 == 0xe0 && cursor + 2 < data.len() {
-            units.push(
-                (u16::from(b0 & 0x0f) << 12)
-                    | (u16::from(data[cursor + 1] & 0x3f) << 6)
-                    | u16::from(data[cursor + 2] & 0x3f),
-            );
-            cursor += 3;
-        } else {
-            units.push(0xfffd);
-            cursor += 1;
-        }
+fn reserve_table(out: &mut Vec<u8>, count: usize, item_size: usize) -> u32 {
+    if count == 0 {
+        return 0;
     }
-    String::from_utf16_lossy(&units)
+    align4(out);
+    let offset = out.len() as u32;
+    out.resize(out.len() + count * item_size, 0);
+    offset
 }
 
 fn write_mutf8(value: &str, out: &mut Vec<u8>) {
@@ -373,112 +308,14 @@ fn write_mutf8(value: &str, out: &mut Vec<u8>) {
     out.push(0);
 }
 
-impl Header {
-    fn parse(data: &[u8]) -> Result<Self> {
-        ensure!(data.len() >= 0x70, "DEX is shorter than its header");
-        ensure!(&data[..4] == b"dex\n", "invalid DEX magic");
-        Ok(Self {
-            string_ids_size: u32_at(data, 0x38)?,
-            string_ids_off: u32_at(data, 0x3c)?,
-            type_ids_size: u32_at(data, 0x40)?,
-            type_ids_off: u32_at(data, 0x44)?,
-            proto_ids_size: u32_at(data, 0x48)?,
-            proto_ids_off: u32_at(data, 0x4c)?,
-            field_ids_size: u32_at(data, 0x50)?,
-            field_ids_off: u32_at(data, 0x54)?,
-            method_ids_size: u32_at(data, 0x58)?,
-            method_ids_off: u32_at(data, 0x5c)?,
-            class_defs_size: u32_at(data, 0x60)?,
-            class_defs_off: u32_at(data, 0x64)?,
-        })
-    }
-}
-
 impl<'a> DexView<'a> {
     fn parse(data: &'a [u8]) -> Result<Self> {
         let header = Header::parse(data)?;
-        bytes_at(
-            data,
-            header.string_ids_off as usize,
-            header.string_ids_size as usize * 4,
-        )?;
-        bytes_at(
-            data,
-            header.type_ids_off as usize,
-            header.type_ids_size as usize * 4,
-        )?;
-        bytes_at(
-            data,
-            header.proto_ids_off as usize,
-            header.proto_ids_size as usize * 12,
-        )?;
-        bytes_at(
-            data,
-            header.field_ids_off as usize,
-            header.field_ids_size as usize * 8,
-        )?;
-        bytes_at(
-            data,
-            header.method_ids_off as usize,
-            header.method_ids_size as usize * 8,
-        )?;
-        bytes_at(
-            data,
-            header.class_defs_off as usize,
-            header.class_defs_size as usize * 32,
-        )?;
-
-        let mut strings = Vec::with_capacity(header.string_ids_size as usize);
-        for index in 0..header.string_ids_size as usize {
-            let mut cursor = u32_at(data, header.string_ids_off as usize + index * 4)? as usize;
-            let _utf16_len = read_uleb(data, &mut cursor)?;
-            let end = data[cursor..]
-                .iter()
-                .position(|&byte| byte == 0)
-                .map(|length| cursor + length)
-                .with_context(|| format!("unterminated string #{index}"))?;
-            strings.push(decode_mutf8(&data[cursor..end]));
-        }
-
-        let mut type_descriptor_indices = Vec::with_capacity(header.type_ids_size as usize);
-        for index in 0..header.type_ids_size as usize {
-            let value = u32_at(data, header.type_ids_off as usize + index * 4)?;
-            ensure!(
-                value < header.string_ids_size,
-                "invalid type descriptor index"
-            );
-            type_descriptor_indices.push(value);
-        }
-
-        let mut protos = Vec::with_capacity(header.proto_ids_size as usize);
-        for index in 0..header.proto_ids_size as usize {
-            let offset = header.proto_ids_off as usize + index * 12;
-            protos.push(ProtoId {
-                shorty_idx: u32_at(data, offset)?,
-                return_type_idx: u32_at(data, offset + 4)?,
-                parameters_off: u32_at(data, offset + 8)?,
-            });
-        }
-
-        let mut fields = Vec::with_capacity(header.field_ids_size as usize);
-        for index in 0..header.field_ids_size as usize {
-            let offset = header.field_ids_off as usize + index * 8;
-            fields.push(FieldId {
-                class_idx: u16_at(data, offset)?,
-                type_idx: u16_at(data, offset + 2)?,
-                name_idx: u32_at(data, offset + 4)?,
-            });
-        }
-
-        let mut methods = Vec::with_capacity(header.method_ids_size as usize);
-        for index in 0..header.method_ids_size as usize {
-            let offset = header.method_ids_off as usize + index * 8;
-            methods.push(MethodId {
-                class_idx: u16_at(data, offset)?,
-                proto_idx: u16_at(data, offset + 2)?,
-                name_idx: u32_at(data, offset + 4)?,
-            });
-        }
+        let strings = read_strings(data, &header)?;
+        let type_descriptor_indices = read_types(data, &header)?;
+        let protos = read_proto_ids(data, &header)?;
+        let fields = read_field_ids(data, &header)?;
+        let methods = read_method_ids(data, &header)?;
 
         Ok(Self {
             data,
@@ -531,15 +368,7 @@ impl<'a> DexView<'a> {
     }
 
     fn type_list(&self, offset: u32) -> Result<Vec<u16>> {
-        if offset == 0 {
-            return Ok(Vec::new());
-        }
-        let size = u32_at(self.data, offset as usize)? as usize;
-        let mut result = Vec::with_capacity(size);
-        for index in 0..size {
-            result.push(u16_at(self.data, offset as usize + 4 + index * 2)?);
-        }
-        Ok(result)
+        read_type_list(self.data, offset, self.header.type_ids_size)
     }
 
     fn class_data(&self, offset: u32) -> Result<ClassData> {
@@ -652,75 +481,6 @@ impl<'a> DexView<'a> {
     }
 }
 
-fn instruction_width(units: &[u16], pc: usize) -> Result<usize> {
-    let unit = *units.get(pc).context("instruction starts past code item")?;
-    let opcode = (unit & 0xff) as u8;
-    if opcode == 0 {
-        return match unit >> 8 {
-            0 => Ok(1),
-            1 => {
-                let size = usize::from(*units.get(pc + 1).context("truncated packed-switch")?);
-                Ok(4 + size * 2)
-            }
-            2 => {
-                let size = usize::from(*units.get(pc + 1).context("truncated sparse-switch")?);
-                Ok(2 + size * 4)
-            }
-            3 => {
-                let width = usize::from(*units.get(pc + 1).context("truncated array payload")?);
-                let low = u32::from(*units.get(pc + 2).context("truncated array payload")?);
-                let high = u32::from(*units.get(pc + 3).context("truncated array payload")?);
-                let count = usize::try_from(low | (high << 16)).context("array size overflow")?;
-                Ok(4 + width.saturating_mul(count).div_ceil(2))
-            }
-            ident => bail!("unknown DEX payload identifier 0x{ident:02x}"),
-        };
-    }
-    Ok(match opcode {
-        0x01
-        | 0x04
-        | 0x07
-        | 0x0a..=0x12
-        | 0x1d..=0x1e
-        | 0x21
-        | 0x27..=0x28
-        | 0x3e..=0x43
-        | 0x73
-        | 0x79..=0x8f
-        | 0xb0..=0xcf
-        | 0xe3..=0xf9 => 1,
-        0x02
-        | 0x05
-        | 0x08
-        | 0x13
-        | 0x15..=0x16
-        | 0x19..=0x1a
-        | 0x1c
-        | 0x1f..=0x20
-        | 0x22..=0x23
-        | 0x29
-        | 0x2d..=0x3d
-        | 0x44..=0x6d
-        | 0x90..=0xaf
-        | 0xd0..=0xe2
-        | 0xfe..=0xff => 2,
-        0x03
-        | 0x06
-        | 0x09
-        | 0x14
-        | 0x17
-        | 0x1b
-        | 0x24..=0x26
-        | 0x2a..=0x2c
-        | 0x6e..=0x72
-        | 0x74..=0x78
-        | 0xfc..=0xfd => 3,
-        0xfa..=0xfb => 4,
-        0x18 => 5,
-        0x00 => unreachable!(),
-    })
-}
-
 fn remap_code_indices(code: &mut CodeItem, refs: &mut BytecodeRefs) -> Result<()> {
     let mut units = code
         .insns
@@ -797,6 +557,7 @@ fn remap_code_indices(code: &mut CodeItem, refs: &mut BytecodeRefs) -> Result<()
 struct MetadataRefs {
     strings: BTreeSet<u32>,
     types: BTreeSet<u32>,
+    protos: BTreeSet<u32>,
     fields: BTreeSet<u32>,
     methods: BTreeSet<u32>,
 }
@@ -811,6 +572,17 @@ fn parse_encoded_value(
     let value_type = header & 0x1f;
     let value_arg = header >> 5;
     match value_type {
+        0x15 => {
+            let size = usize::from(value_arg) + 1;
+            let bytes = bytes_at(data, *cursor, size)?;
+            *cursor += size;
+            let old = bytes.iter().enumerate().fold(0u32, |value, (shift, byte)| {
+                value | (u32::from(*byte) << (shift * 8))
+            });
+            refs.protos.insert(old);
+            Ok(EncodedValue::Indexed(IndexKind::Proto, old))
+        }
+        0x16 => bail!("method-handle encoded values are not supported by minimal DEX output"),
         0x17..=0x1b => {
             let size = usize::from(value_arg) + 1;
             let bytes = bytes_at(data, *cursor, size)?;
@@ -827,9 +599,13 @@ fn parse_encoded_value(
                     refs.types.insert(old);
                     IndexKind::Type
                 }
-                0x19 | 0x1b => {
+                0x19 => {
                     refs.fields.insert(old);
                     IndexKind::Field
+                }
+                0x1b => {
+                    refs.fields.insert(old);
+                    IndexKind::Enum
                 }
                 0x1a => {
                     refs.methods.insert(old);
@@ -1328,6 +1104,134 @@ impl<'a> IndexMapper<'a> {
         }
         Ok(())
     }
+
+    /// Put every identifier table in the canonical order required by the DEX
+    /// format and update all cross-table and source-to-output mappings.
+    fn canonicalize(&mut self) -> Result<()> {
+        let mut strings = self.strings.drain(..).enumerate().collect::<Vec<_>>();
+        strings.sort_by(|(_, left), (_, right)| utf16_cmp(left, right));
+        let mut string_remap = vec![0u32; strings.len()];
+        self.strings = Vec::with_capacity(strings.len());
+        for (new, (old, value)) in strings.into_iter().enumerate() {
+            string_remap[old] = new as u32;
+            self.strings.push(value);
+        }
+        self.string_by_value.clear();
+        for (index, value) in self.strings.iter().enumerate() {
+            self.string_by_value.insert(value.clone(), index as u32);
+        }
+
+        for descriptor_idx in &mut self.types {
+            *descriptor_idx = string_remap[*descriptor_idx as usize];
+        }
+        for proto in &mut self.protos {
+            proto.shorty_idx = string_remap[proto.shorty_idx as usize];
+        }
+        for field in &mut self.fields {
+            field.name_idx = string_remap[field.name_idx as usize];
+        }
+        for method in &mut self.methods {
+            method.name_idx = string_remap[method.name_idx as usize];
+        }
+
+        let mut types = self.types.drain(..).enumerate().collect::<Vec<_>>();
+        types.sort_by_key(|(_, descriptor_idx)| *descriptor_idx);
+        let mut type_remap = vec![0u16; types.len()];
+        self.types = Vec::with_capacity(types.len());
+        for (old, descriptor_idx) in types {
+            let new = if self.types.last() == Some(&descriptor_idx) {
+                self.types.len() - 1
+            } else {
+                self.types.push(descriptor_idx);
+                self.types.len() - 1
+            };
+            type_remap[old] = u16::try_from(new).context("minimal DEX has too many types")?;
+        }
+        for index in self.origin_types.values_mut() {
+            *index = type_remap[usize::from(*index)];
+        }
+        for index in self.primitive_types.values_mut() {
+            *index = type_remap[usize::from(*index)];
+        }
+        self.synthetic_types = self
+            .types
+            .iter()
+            .enumerate()
+            .map(|(type_idx, &descriptor_idx)| (descriptor_idx, type_idx as u16))
+            .collect();
+        for proto in &mut self.protos {
+            proto.return_type_idx = u32::from(type_remap[proto.return_type_idx as usize]);
+            for parameter in &mut proto.params {
+                *parameter = type_remap[usize::from(*parameter)];
+            }
+        }
+        for field in &mut self.fields {
+            field.class_idx = type_remap[usize::from(field.class_idx)];
+            field.type_idx = type_remap[usize::from(field.type_idx)];
+        }
+        for method in &mut self.methods {
+            method.class_idx = type_remap[usize::from(method.class_idx)];
+        }
+
+        let mut protos = self.protos.drain(..).enumerate().collect::<Vec<_>>();
+        protos.sort_by(|(_, left), (_, right)| {
+            left.return_type_idx
+                .cmp(&right.return_type_idx)
+                .then_with(|| left.params.cmp(&right.params))
+        });
+        let mut proto_remap = vec![0u16; protos.len()];
+        self.protos = Vec::with_capacity(protos.len());
+        for (old, proto) in protos {
+            let new = if self.protos.last() == Some(&proto) {
+                self.protos.len() - 1
+            } else {
+                self.protos.push(proto);
+                self.protos.len() - 1
+            };
+            proto_remap[old] = u16::try_from(new).context("minimal DEX has too many protos")?;
+        }
+        for index in self.origin_protos.values_mut() {
+            *index = proto_remap[usize::from(*index)];
+        }
+        for method in &mut self.methods {
+            method.proto_idx = proto_remap[usize::from(method.proto_idx)];
+        }
+
+        let mut fields = self.fields.drain(..).enumerate().collect::<Vec<_>>();
+        fields.sort_by_key(|(_, field)| (field.class_idx, field.name_idx, field.type_idx));
+        let mut field_remap = vec![0u16; fields.len()];
+        self.fields = Vec::with_capacity(fields.len());
+        for (old, field) in fields {
+            let new = if self.fields.last() == Some(&field) {
+                self.fields.len() - 1
+            } else {
+                self.fields.push(field);
+                self.fields.len() - 1
+            };
+            field_remap[old] = u16::try_from(new).context("minimal DEX has too many fields")?;
+        }
+        for index in self.origin_fields.values_mut() {
+            *index = field_remap[usize::from(*index)];
+        }
+
+        let mut methods = self.methods.drain(..).enumerate().collect::<Vec<_>>();
+        methods.sort_by_key(|(_, method)| (method.class_idx, method.name_idx, method.proto_idx));
+        let mut method_remap = vec![0u16; methods.len()];
+        self.methods = Vec::with_capacity(methods.len());
+        for (old, method) in methods {
+            let new = if self.methods.last() == Some(&method) {
+                self.methods.len() - 1
+            } else {
+                self.methods.push(method);
+                self.methods.len() - 1
+            };
+            method_remap[old] = u16::try_from(new).context("minimal DEX has too many methods")?;
+        }
+        for index in self.origin_methods.values_mut() {
+            *index = method_remap[usize::from(*index)];
+        }
+        Ok(())
+    }
 }
 
 fn normalize_code_indices(
@@ -1343,24 +1247,87 @@ fn normalize_code_indices(
     let mut pc = 0usize;
     while pc < units.len() {
         let opcode = (units[pc] & 0xff) as u8;
-        if opcode == 0x1a {
-            let temporary = usize::from(units[pc + 1]);
-            let old = *refs
-                .strings
-                .values
-                .get(temporary)
-                .context("invalid temporary string index")?;
-            units[pc + 1] = mapper.mapped_string(old)? as u16;
-        } else if opcode == 0x1b {
-            let temporary = u32::from(units[pc + 1]) | (u32::from(units[pc + 2]) << 16);
-            let old = *refs
-                .strings
-                .values
-                .get(temporary as usize)
-                .context("invalid temporary jumbo string index")?;
-            let new = mapper.mapped_string(old)?;
-            units[pc + 1] = new as u16;
-            units[pc + 2] = (new >> 16) as u16;
+        let short_temporary = || {
+            units
+                .get(pc + 1)
+                .copied()
+                .map(usize::from)
+                .context("truncated indexed instruction")
+        };
+        match opcode {
+            0x1a => {
+                let old = refs.strings.values[short_temporary()?];
+                units[pc + 1] = u16::try_from(mapper.mapped_string(old)?)
+                    .context("const-string index requires jumbo encoding")?;
+            }
+            0x1b => {
+                let temporary = u32::from(units[pc + 1]) | (u32::from(units[pc + 2]) << 16);
+                let old = *refs
+                    .strings
+                    .values
+                    .get(temporary as usize)
+                    .context("invalid temporary jumbo string index")?;
+                let new = mapper.mapped_string(old)?;
+                units[pc + 1] = new as u16;
+                units[pc + 2] = (new >> 16) as u16;
+            }
+            0x1c | 0x1f | 0x20 | 0x22..=0x25 => {
+                let old = refs
+                    .types
+                    .values
+                    .get(short_temporary()?)
+                    .copied()
+                    .context("invalid temporary type index")?;
+                units[pc + 1] = mapper.mapped_type(old)?;
+            }
+            0x52..=0x6d => {
+                let old = refs
+                    .fields
+                    .values
+                    .get(short_temporary()?)
+                    .copied()
+                    .context("invalid temporary field index")?;
+                units[pc + 1] = mapper.mapped_field(old)?;
+            }
+            0x6e..=0x72 | 0x74..=0x78 => {
+                let old = refs
+                    .methods
+                    .values
+                    .get(short_temporary()?)
+                    .copied()
+                    .context("invalid temporary method index")?;
+                units[pc + 1] = mapper.mapped_method(old)?;
+            }
+            0xfa..=0xfb => {
+                let old_method = refs
+                    .methods
+                    .values
+                    .get(short_temporary()?)
+                    .copied()
+                    .context("invalid temporary method index")?;
+                units[pc + 1] = mapper.mapped_method(old_method)?;
+                let temporary_proto = usize::from(units[pc + 3]);
+                let old_proto = refs
+                    .protos
+                    .values
+                    .get(temporary_proto)
+                    .copied()
+                    .context("invalid temporary proto index")?;
+                units[pc + 3] = mapper
+                    .origin_protos
+                    .get(&old_proto)
+                    .copied()
+                    .context("proto was not included in minimal DEX")?;
+            }
+            0xff => {
+                let old = refs.protos.values[short_temporary()?];
+                units[pc + 1] = mapper
+                    .origin_protos
+                    .get(&old)
+                    .copied()
+                    .context("proto was not included in minimal DEX")?;
+            }
+            _ => {}
         }
         pc += instruction_width(&units, pc)?;
     }
@@ -1377,11 +1344,18 @@ fn write_indexed_value(
     mapper: &IndexMapper<'_>,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    let (value_type, new) = match kind {
-        IndexKind::String => (0x17, mapper.mapped_string(old)?),
-        IndexKind::Type => (0x18, u32::from(mapper.mapped_type(old)?)),
-        IndexKind::Field => (0x19, u32::from(mapper.mapped_field(old)?)),
-        IndexKind::Method => (0x1a, u32::from(mapper.mapped_method(old)?)),
+    let new = match kind {
+        IndexKind::Proto => u32::from(
+            mapper
+                .origin_protos
+                .get(&old)
+                .copied()
+                .context("proto was not included in minimal DEX")?,
+        ),
+        IndexKind::String => mapper.mapped_string(old)?,
+        IndexKind::Type => u32::from(mapper.mapped_type(old)?),
+        IndexKind::Field | IndexKind::Enum => u32::from(mapper.mapped_field(old)?),
+        IndexKind::Method => u32::from(mapper.mapped_method(old)?),
     };
     let size = if new <= 0xff {
         1
@@ -1392,7 +1366,7 @@ fn write_indexed_value(
     } else {
         4
     };
-    out.push(((size - 1) << 5) | value_type);
+    out.push(((size - 1) << 5) | kind.encoded_value_type());
     for shift in 0..size {
         out.push((new >> (shift * 8)) as u8);
     }
@@ -1523,6 +1497,9 @@ fn include_metadata_refs(mapper: &mut IndexMapper<'_>, refs: &MetadataRefs) -> R
     for &index in &refs.types {
         mapper.add_origin_type(index)?;
     }
+    for &index in &refs.protos {
+        mapper.add_proto(index)?;
+    }
     for &index in &refs.fields {
         mapper.add_field(index)?;
     }
@@ -1604,6 +1581,17 @@ fn build_dex(
     mapper: &IndexMapper<'_>,
 ) -> Result<Vec<u8>> {
     let mut out = vec![0; 0x70];
+
+    // Reserve all fixed-width identifier tables before the data section. Their
+    // entries are patched once the variable-width data offsets are known.
+    let string_ids_off = reserve_table(&mut out, mapper.strings.len(), 4);
+    let type_ids_off = reserve_table(&mut out, mapper.types.len(), 4);
+    let proto_ids_off = reserve_table(&mut out, mapper.protos.len(), 12);
+    let field_ids_off = reserve_table(&mut out, mapper.fields.len(), 8);
+    let method_ids_off = reserve_table(&mut out, mapper.methods.len(), 8);
+    let class_defs_off = reserve_table(&mut out, 1, 32);
+    align4(&mut out);
+    let data_off = out.len() as u32;
 
     let mut string_data_offsets = Vec::with_capacity(mapper.strings.len());
     for value in &mapper.strings {
@@ -1869,56 +1857,59 @@ fn build_dex(
             0
         };
 
-    align4(&mut out);
-    let string_ids_off = out.len() as u32;
-    for offset in &string_data_offsets {
-        push_u32(&mut out, *offset);
+    for (index, offset) in string_data_offsets.iter().enumerate() {
+        patch_u32(&mut out, string_ids_off as usize + index * 4, *offset);
     }
-    let type_ids_off = out.len() as u32;
-    for descriptor_idx in &mapper.types {
-        push_u32(&mut out, *descriptor_idx);
+    for (index, descriptor_idx) in mapper.types.iter().enumerate() {
+        patch_u32(&mut out, type_ids_off as usize + index * 4, *descriptor_idx);
     }
-    let proto_ids_off = out.len() as u32;
     for (index, proto) in mapper.protos.iter().enumerate() {
-        push_u32(&mut out, proto.shorty_idx);
-        push_u32(&mut out, proto.return_type_idx);
-        push_u32(&mut out, proto_param_offsets[index]);
+        let offset = proto_ids_off as usize + index * 12;
+        patch_u32(&mut out, offset, proto.shorty_idx);
+        patch_u32(&mut out, offset + 4, proto.return_type_idx);
+        patch_u32(&mut out, offset + 8, proto_param_offsets[index]);
     }
-    let field_ids_off = out.len() as u32;
-    for field in &mapper.fields {
-        push_u16(&mut out, field.class_idx);
-        push_u16(&mut out, field.type_idx);
-        push_u32(&mut out, field.name_idx);
+    for (index, field) in mapper.fields.iter().enumerate() {
+        let offset = field_ids_off as usize + index * 8;
+        patch_u16(&mut out, offset, field.class_idx);
+        patch_u16(&mut out, offset + 2, field.type_idx);
+        patch_u32(&mut out, offset + 4, field.name_idx);
     }
-    let method_ids_off = out.len() as u32;
-    for method in &mapper.methods {
-        push_u16(&mut out, method.class_idx);
-        push_u16(&mut out, method.proto_idx);
-        push_u32(&mut out, method.name_idx);
+    for (index, method) in mapper.methods.iter().enumerate() {
+        let offset = method_ids_off as usize + index * 8;
+        patch_u16(&mut out, offset, method.class_idx);
+        patch_u16(&mut out, offset + 2, method.proto_idx);
+        patch_u32(&mut out, offset + 4, method.name_idx);
     }
-    let class_defs_off = out.len() as u32;
-    push_u32(&mut out, u32::from(mapper.mapped_type(class.class_idx)?));
-    push_u32(&mut out, class.access_flags);
-    push_u32(
+    let class_offset = class_defs_off as usize;
+    patch_u32(
         &mut out,
+        class_offset,
+        u32::from(mapper.mapped_type(class.class_idx)?),
+    );
+    patch_u32(&mut out, class_offset + 4, class.access_flags);
+    patch_u32(
+        &mut out,
+        class_offset + 8,
         if class.superclass_idx == NO_INDEX {
             NO_INDEX
         } else {
             u32::from(mapper.mapped_type(class.superclass_idx)?)
         },
     );
-    push_u32(&mut out, interfaces_off);
-    push_u32(
+    patch_u32(&mut out, class_offset + 12, interfaces_off);
+    patch_u32(
         &mut out,
+        class_offset + 16,
         if class.source_file_idx == NO_INDEX {
             NO_INDEX
         } else {
             mapper.mapped_string(class.source_file_idx)?
         },
     );
-    push_u32(&mut out, annotation_directory_off);
-    push_u32(&mut out, class_data_off);
-    push_u32(&mut out, static_values_off);
+    patch_u32(&mut out, class_offset + 20, annotation_directory_off);
+    patch_u32(&mut out, class_offset + 24, class_data_off);
+    patch_u32(&mut out, class_offset + 28, static_values_off);
 
     align4(&mut out);
     let map_off = out.len() as u32;
@@ -2059,7 +2050,28 @@ fn build_dex(
 
     ensure!(out.len() <= u32::MAX as usize, "minimal DEX is too large");
     let file_size = out.len() as u32;
-    out[0..8].copy_from_slice(b"dex\n035\0");
+    let mut version = 35;
+    for code in hollowed.codes.values() {
+        let units = code
+            .insns
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        let mut pc = 0;
+        while pc < units.len() {
+            match (units[pc] & 0xff) as u8 {
+                0xff => version = 39,
+                0xfa..=0xfb if version < 38 => version = 38,
+                _ => {}
+            }
+            pc += instruction_width(&units, pc)?;
+        }
+    }
+    match version {
+        39 => out[0..8].copy_from_slice(b"dex\n039\0"),
+        38 => out[0..8].copy_from_slice(b"dex\n038\0"),
+        _ => out[0..8].copy_from_slice(b"dex\n035\0"),
+    }
     patch_u32(&mut out, 0x20, file_size);
     patch_u32(&mut out, 0x24, 0x70);
     patch_u32(&mut out, 0x28, 0x1234_5678);
@@ -2076,8 +2088,8 @@ fn build_dex(
     patch_u32(&mut out, 0x5c, method_ids_off);
     patch_u32(&mut out, 0x60, 1);
     patch_u32(&mut out, 0x64, class_defs_off);
-    patch_u32(&mut out, 0x68, file_size - 0x70);
-    patch_u32(&mut out, 0x6c, 0x70);
+    patch_u32(&mut out, 0x68, file_size - data_off);
+    patch_u32(&mut out, 0x6c, data_off);
     let signature = Sha1::digest(&out[32..]);
     out[12..32].copy_from_slice(&signature);
     let checksum = adler32_slice(&out[12..]);
@@ -2100,6 +2112,179 @@ pub struct MinimalDexStats {
 pub struct MinimalDex {
     pub bytes: Vec<u8>,
     pub stats: MinimalDexStats,
+}
+
+/// Validate the structural invariants relied on by Android runtimes and DEX
+/// tooling. This is intentionally stricter than the parser used for reading an
+/// arbitrary input DEX because ASC-RS controls every byte of rebuilt output.
+pub fn validate_minimal_dex(data: &[u8]) -> Result<()> {
+    let header = Header::parse(data)?;
+    ensure!(
+        matches!(&data[..8], b"dex\n035\0" | b"dex\n038\0" | b"dex\n039\0"),
+        "unsupported rebuilt DEX version"
+    );
+    ensure!(
+        u32_at(data, 0x20)? as usize == data.len(),
+        "DEX header file_size does not match the output length"
+    );
+    let signature = Sha1::digest(&data[32..]);
+    ensure!(
+        &data[12..32] == signature.as_slice(),
+        "invalid DEX SHA-1 signature"
+    );
+    ensure!(
+        u32_at(data, 8)? == adler32_slice(&data[12..]),
+        "invalid DEX Adler-32 checksum"
+    );
+
+    let data_size = u32_at(data, 0x68)? as usize;
+    let data_off = u32_at(data, 0x6c)? as usize;
+    ensure!(
+        data_off >= 0x70 && data_off <= data.len(),
+        "invalid data_off"
+    );
+    ensure!(
+        data_off + data_size == data.len(),
+        "data section does not cover the rebuilt DEX tail"
+    );
+    let map_off = u32_at(data, 0x34)? as usize;
+    ensure!(
+        map_off >= data_off && map_off < data.len() && map_off & 3 == 0,
+        "invalid map_list offset"
+    );
+    let map_count = u32_at(data, map_off)? as usize;
+    bytes_at(
+        data,
+        map_off + 4,
+        map_count
+            .checked_mul(12)
+            .context("map_list size overflow")?,
+    )?;
+    let mut map_types = BTreeSet::new();
+    let mut previous_map_offset = None;
+    for index in 0..map_count {
+        let offset = map_off + 4 + index * 12;
+        let item_type = u16_at(data, offset)?;
+        let item_size = u32_at(data, offset + 4)?;
+        let item_offset = u32_at(data, offset + 8)?;
+        ensure!(item_size != 0, "map item #{index} has zero size");
+        ensure!(
+            map_types.insert(item_type),
+            "map_list contains duplicate item type 0x{item_type:04x}"
+        );
+        if let Some(previous) = previous_map_offset {
+            ensure!(previous < item_offset, "map_list offsets are not ordered");
+        }
+        previous_map_offset = Some(item_offset);
+    }
+    ensure!(
+        map_types.contains(&0x0000) && map_types.contains(&0x0006) && map_types.contains(&0x1000),
+        "map_list is missing a required rebuilt DEX section"
+    );
+    for (name, count, offset, width) in [
+        (
+            "string_ids",
+            header.string_ids_size,
+            header.string_ids_off,
+            4usize,
+        ),
+        ("type_ids", header.type_ids_size, header.type_ids_off, 4),
+        ("proto_ids", header.proto_ids_size, header.proto_ids_off, 12),
+        ("field_ids", header.field_ids_size, header.field_ids_off, 8),
+        (
+            "method_ids",
+            header.method_ids_size,
+            header.method_ids_off,
+            8,
+        ),
+        (
+            "class_defs",
+            header.class_defs_size,
+            header.class_defs_off,
+            32,
+        ),
+    ] {
+        ensure!(
+            (count == 0) == (offset == 0),
+            "{name} count and offset must both be zero or non-zero"
+        );
+        if count != 0 {
+            let end = offset as usize + count as usize * width;
+            ensure!(end <= data_off, "{name} overlaps the data section");
+        }
+    }
+
+    let dex = DexView::parse(data)?;
+    ensure!(
+        dex.strings
+            .windows(2)
+            .all(|pair| utf16_cmp(&pair[0], &pair[1]).is_lt()),
+        "string_ids must be strictly sorted and unique"
+    );
+    ensure!(
+        dex.type_descriptor_indices
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]),
+        "type_ids must be strictly sorted and unique"
+    );
+
+    let mut proto_keys = Vec::with_capacity(dex.protos.len());
+    for proto in &dex.protos {
+        ensure!(
+            proto.shorty_idx < header.string_ids_size
+                && proto.return_type_idx < header.type_ids_size,
+            "invalid proto identifier"
+        );
+        let params = dex.type_list(proto.parameters_off)?;
+        ensure!(
+            params
+                .iter()
+                .all(|&index| u32::from(index) < header.type_ids_size),
+            "invalid proto parameter type"
+        );
+        proto_keys.push((proto.return_type_idx, params));
+    }
+    ensure!(
+        proto_keys.windows(2).all(|pair| pair[0] < pair[1]),
+        "proto_ids must be strictly sorted and unique"
+    );
+
+    let field_keys = dex
+        .fields
+        .iter()
+        .map(|field| {
+            ensure!(
+                u32::from(field.class_idx) < header.type_ids_size
+                    && u32::from(field.type_idx) < header.type_ids_size
+                    && field.name_idx < header.string_ids_size,
+                "invalid field identifier"
+            );
+            Ok((field.class_idx, field.name_idx, field.type_idx))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        field_keys.windows(2).all(|pair| pair[0] < pair[1]),
+        "field_ids must be strictly sorted and unique"
+    );
+
+    let method_keys = dex
+        .methods
+        .iter()
+        .map(|method| {
+            ensure!(
+                u32::from(method.class_idx) < header.type_ids_size
+                    && u32::from(method.proto_idx) < header.proto_ids_size
+                    && method.name_idx < header.string_ids_size,
+                "invalid method identifier"
+            );
+            Ok((method.class_idx, method.name_idx, method.proto_idx))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        method_keys.windows(2).all(|pair| pair[0] < pair[1]),
+        "method_ids must be strictly sorted and unique"
+    );
+    Ok(())
 }
 
 /// Extract one class and its direct DEX dependencies into a dense, standalone DEX.
@@ -2131,16 +2316,25 @@ pub fn extract_minimal_dex(data: &[u8], descriptor: &str) -> Result<MinimalDex> 
         mapper.add_origin_type(u32::from(interface))?;
     }
     include_metadata_refs(&mut mapper, &hollowed.metadata_refs)?;
+    for code in hollowed.codes.values() {
+        for handler in &code.handlers {
+            for &(type_idx, _) in &handler.pairs {
+                mapper.add_origin_type(type_idx)?;
+            }
+        }
+    }
+    mapper.canonicalize()?;
     for code in hollowed.codes.values_mut() {
         for handler in &mut code.handlers {
             for pair in &mut handler.pairs {
-                pair.0 = u32::from(mapper.add_origin_type(pair.0)?);
+                pair.0 = u32::from(mapper.mapped_type(pair.0)?);
             }
         }
         normalize_code_indices(code, &bytecode_refs, &mapper)?;
     }
 
     let bytes = build_dex(class, &class_data, &hollowed, &mapper)?;
+    validate_minimal_dex(&bytes)?;
     let stats = MinimalDexStats {
         input_bytes: data.len(),
         output_bytes: bytes.len(),
@@ -2151,4 +2345,31 @@ pub fn extract_minimal_dex(data: &[u8], descriptor: &str) -> Result<MinimalDex> 
         methods: mapper.methods.len(),
     };
     Ok(MinimalDex { bytes, stats })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keeps_enum_and_field_encoded_values_distinct() {
+        let mut enum_cursor = 0;
+        let mut enum_refs = MetadataRefs::default();
+        let enum_value = parse_encoded_value(&[0x1b, 7], &mut enum_cursor, &mut enum_refs)
+            .expect("parse enum value");
+        assert!(matches!(
+            enum_value,
+            EncodedValue::Indexed(IndexKind::Enum, 7)
+        ));
+        assert_eq!(IndexKind::Enum.encoded_value_type(), 0x1b);
+        assert_eq!(IndexKind::Field.encoded_value_type(), 0x19);
+        assert!(enum_refs.fields.contains(&7));
+    }
+
+    #[test]
+    fn rejects_unrepresentable_method_handle_values() {
+        let error =
+            parse_encoded_value(&[0x16, 0], &mut 0, &mut MetadataRefs::default()).unwrap_err();
+        assert!(error.to_string().contains("method-handle"));
+    }
 }

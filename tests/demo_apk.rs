@@ -1,11 +1,12 @@
-use std::{env, path::Path};
+use std::{env, path::Path, sync::Arc};
 
 use asc_rs::{
-    apk::load_dexes,
-    dex::{Dex, Query, ReferenceKind},
-    minidex::extract_minimal_dex,
+    apk::ApkSession,
+    dex::{Dex, Query, ReferenceKind, class_descriptors},
+    minidex::{extract_minimal_dex, validate_minimal_dex},
+    service::AscSession,
 };
-use dex_decompiler::parse_dex;
+use dex_decompiler::{DecompilationMode, Decompiler, DecompilerOptions, parse_dex};
 use sha1::{Digest, Sha1};
 
 /// Run with ASC_TEST_APK set to an APK fixture. Keeping the path outside the
@@ -16,7 +17,20 @@ fn external_demo_apk_class_and_string_reference() {
         eprintln!("ASC_TEST_APK is not set; external APK test skipped");
         return;
     };
-    let entries = load_dexes(Path::new(&path), 4).expect("load test APK");
+    let apk = ApkSession::open(Path::new(&path), 4).expect("open test APK");
+    assert_eq!(apk.cached_dex_count(), 0);
+    let indexed = apk
+        .find_class("Lcom/zj/wuaipojie/ui/MainActivity;")
+        .expect("index class tables")
+        .expect("find MainActivity");
+    assert_eq!(apk.cached_dex_count(), 1);
+    let indexed_again = apk
+        .find_class("Lcom/zj/wuaipojie/ui/MainActivity;")
+        .expect("reuse class index")
+        .expect("find MainActivity again");
+    assert!(Arc::ptr_eq(&indexed.data, &indexed_again.data));
+
+    let entries = apk.load_all_dexes().expect("load test DEX entries");
     let mut found_class = false;
     let mut found_reference = false;
     let mut class_entry = None;
@@ -31,6 +45,16 @@ fn external_demo_apk_class_and_string_reference() {
         let refs = dex
             .scan_references(ReferenceKind::String, &targets)
             .expect("scan string references");
+        let sites = dex
+            .scan_reference_sites(ReferenceKind::String, &targets)
+            .expect("scan string reference sites");
+        if !sites.is_empty() {
+            assert!(sites.iter().all(|site| site.code_unit_offset > 0));
+            assert!(
+                dex.format_method(sites[0].caller_index)
+                    .contains("alertFirst()V")
+            );
+        }
         found_reference |= !refs.is_empty();
     }
     assert!(found_class, "demo MainActivity was not found");
@@ -42,6 +66,7 @@ fn external_demo_apk_class_and_string_reference() {
     let original = class_entry.expect("DEX containing MainActivity");
     let minimal = extract_minimal_dex(&original, "Lcom/zj/wuaipojie/ui/MainActivity;")
         .expect("extract minimal DEX");
+    validate_minimal_dex(&minimal.bytes).expect("validate canonical rebuilt DEX");
     assert!(minimal.bytes.len() < original.len() / 1000);
     assert_eq!(&minimal.bytes[..8], b"dex\n035\0");
     assert_eq!(
@@ -68,4 +93,48 @@ fn external_demo_apk_class_and_string_reference() {
         .expect("read rebuilt class data")
         .expect("class data exists");
     assert_eq!(data.direct_methods.len() + data.virtual_methods.len(), 7);
+
+    let descriptors = class_descriptors(&original).expect("list class descriptors");
+    let sample_step = (descriptors.len() / 100).max(1);
+    for descriptor in descriptors.iter().step_by(sample_step).take(100) {
+        let rebuilt = extract_minimal_dex(&original, descriptor)
+            .unwrap_or_else(|error| panic!("extract {descriptor}: {error:#}"));
+        validate_minimal_dex(&rebuilt.bytes)
+            .unwrap_or_else(|error| panic!("validate {descriptor}: {error:#}"));
+        let parsed =
+            parse_dex(&rebuilt.bytes).unwrap_or_else(|error| panic!("parse {descriptor}: {error}"));
+        let class = parsed
+            .class_defs()
+            .next()
+            .expect("one rebuilt class")
+            .unwrap_or_else(|error| panic!("read {descriptor}: {error}"));
+        let options = DecompilerOptions {
+            mode: DecompilationMode::Simple,
+            resource_map: Some(Default::default()),
+            ..Default::default()
+        };
+        Decompiler::with_options(&parsed, options)
+            .decompile_class(&class)
+            .unwrap_or_else(|error| panic!("decompile {descriptor}: {error}"));
+    }
+
+    let asc = AscSession::open(Path::new(&path), 4).expect("open service session");
+    let search = asc
+        .find_references(&Query::String("请先注册id".to_owned()))
+        .expect("search through service API");
+    assert!(
+        search.references.iter().any(|reference| {
+            reference.caller_method.contains("alertFirst()V")
+                && reference.target_symbol == "请先注册id"
+                && reference.code_unit_offset > 0
+        }),
+        "structured service result should retain signature, target, and offset"
+    );
+    let decompiled = asc
+        .decompile_class(
+            "com.zj.wuaipojie.ui.MainActivity",
+            DecompilationMode::Simple,
+        )
+        .expect("decompile through service API");
+    assert!(decompiled.source.contains("请先注册id"));
 }

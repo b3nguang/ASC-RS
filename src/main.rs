@@ -1,20 +1,16 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
-    path::{Path, PathBuf},
-    time::Instant,
+    path::PathBuf,
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use asc_rs::{
-    apk::{DexEntry, load_dexes, read_entry},
-    descriptor_to_java,
-    dex::{Dex, MemberQuery, Query},
+    dex::{MemberQuery, Query},
     format_class_name,
-    minidex::{MinimalDexStats, extract_minimal_dex},
+    service::{AscSession, DecompilationMode, decode_manifest},
 };
-use axml_parser::AXMLPrinter;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use dex_decompiler::{DecompilationMode, Decompiler, DecompilerOptions, parse_dex};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -54,7 +50,7 @@ struct CommonArgs {
     /// Enable timing and DEX diagnostics.
     #[arg(long)]
     debug: bool,
-    /// Worker count used to inflate DEX entries.
+    /// Worker count used to inflate and scan DEX entries.
     #[arg(long, alias = "thread", default_value_t = 8)]
     threads: usize,
 }
@@ -146,198 +142,44 @@ fn run() -> Result<()> {
 }
 
 fn manifest(args: ManifestArgs) -> Result<()> {
-    check_apk(&args.apk_path)?;
-    let data = read_entry(&args.apk_path, "AndroidManifest.xml")?;
-    let printer = AXMLPrinter::new(&data);
-    ensure!(
-        printer.is_valid(),
-        "AndroidManifest.xml is not valid binary AXML"
-    );
-    let xml = String::from_utf8(printer.get_xml(!args.compact))
-        .context("decoded AndroidManifest.xml is not UTF-8")?;
-    if let Some(output) = &args.output {
-        fs::write(output, xml.as_bytes())
-            .with_context(|| format!("failed to write {}", output.display()))?;
-    }
-    print!("{xml}");
-    if !xml.ends_with('\n') {
-        println!();
-    }
-    Ok(())
-}
-
-fn check_apk(path: &Path) -> Result<()> {
-    ensure!(path.is_file(), "APK does not exist: {}", path.display());
-    Ok(())
+    let xml = decode_manifest(&args.apk_path, !args.compact)?;
+    write_and_print(&xml, args.output.as_ref())
 }
 
 fn getclass(args: GetClassArgs) -> Result<()> {
-    check_apk(&args.apk_path)?;
-    ensure!(args.common.threads > 0, "--threads must be at least 1");
-    let started = Instant::now();
-    let descriptor = format_class_name(&args.dalvik_class)?;
-    let entries = load_dexes(&args.apk_path, args.common.threads)?;
-    let scan_finished = Instant::now();
-
-    let hit = find_class_entry(&entries, &descriptor)?
-        .with_context(|| format!("class {descriptor} not found in APK"))?;
-    let (source, minimal_stats, extract_ms, decompile_ms) =
-        decompile_in_rust(hit, &descriptor, args.decompilation_mode.into())?;
-    let finished = Instant::now();
-
-    if let Some(output) = &args.output {
-        fs::write(output, source.as_bytes())
-            .with_context(|| format!("failed to write {}", output.display()))?;
-    }
-    print!("{source}");
-    if !source.ends_with('\n') {
-        println!();
-    }
+    let session = AscSession::open(&args.apk_path, args.common.threads)?;
+    let result = session.decompile_class(&args.dalvik_class, args.decompilation_mode.into())?;
+    write_and_print(&result.source, args.output.as_ref())?;
 
     if args.common.debug {
-        eprintln!("[DEBUG] Hit DEX: {}", hit.name);
+        let stats = result.minimal_stats;
+        eprintln!("[DEBUG] Hit DEX: {}", result.dex_name);
         eprintln!(
             "[DEBUG] Minimal DEX: {} -> {} bytes ({:.1}x smaller), strings={} types={} protos={} fields={} methods={}",
-            minimal_stats.input_bytes,
-            minimal_stats.output_bytes,
-            minimal_stats.input_bytes as f64 / minimal_stats.output_bytes as f64,
-            minimal_stats.strings,
-            minimal_stats.types,
-            minimal_stats.protos,
-            minimal_stats.fields,
-            minimal_stats.methods
+            stats.input_bytes,
+            stats.output_bytes,
+            stats.input_bytes as f64 / stats.output_bytes as f64,
+            stats.strings,
+            stats.types,
+            stats.protos,
+            stats.fields,
+            stats.methods
         );
         eprintln!(
-            "[DEBUG] APK scan: {:.3} ms",
-            (scan_finished - started).as_secs_f64() * 1000.0
+            "[DEBUG] APK locate/index: {:.3} ms",
+            result.timings.locate_ms
         );
-        eprintln!("[DEBUG] Extract/rebuild: {extract_ms:.3} ms");
-        eprintln!("[DEBUG] Rust decompile: {decompile_ms:.3} ms");
         eprintln!(
-            "[DEBUG] Total: {:.3} ms",
-            (finished - started).as_secs_f64() * 1000.0
+            "[DEBUG] Extract/rebuild: {:.3} ms",
+            result.timings.extract_ms
         );
+        eprintln!(
+            "[DEBUG] Rust decompile: {:.3} ms",
+            result.timings.decompile_ms
+        );
+        eprintln!("[DEBUG] Total: {:.3} ms", result.timings.total_ms);
     }
     Ok(())
-}
-
-fn find_class_entry<'a>(entries: &'a [DexEntry], descriptor: &str) -> Result<Option<&'a DexEntry>> {
-    for entry in entries {
-        let dex =
-            Dex::parse(&entry.data).with_context(|| format!("failed to parse {}", entry.name))?;
-        if dex.defines_class(descriptor) {
-            return Ok(Some(entry));
-        }
-    }
-    Ok(None)
-}
-
-fn decompile_in_rust(
-    entry: &DexEntry,
-    descriptor: &str,
-    mode: DecompilationMode,
-) -> Result<(String, MinimalDexStats, f64, f64)> {
-    let extract_started = Instant::now();
-    let minimal = extract_minimal_dex(&entry.data, descriptor)
-        .with_context(|| format!("failed to extract {descriptor} from {}", entry.name))?;
-    let extract_finished = Instant::now();
-    let parsed = parse_dex(&minimal.bytes)
-        .map_err(|error| anyhow::anyhow!(error.to_string()))
-        .with_context(|| format!("Androguard dex-parser rejected rebuilt {}", entry.name))?;
-    for class_def in parsed.class_defs() {
-        let class_def = class_def
-            .map_err(|error| anyhow::anyhow!(error.to_string()))
-            .context("failed to read class definition")?;
-        let class_type = parsed
-            .get_type(class_def.class_idx)
-            .map_err(|error| anyhow::anyhow!(error.to_string()))
-            .context("failed to resolve class descriptor")?;
-        if class_type != descriptor {
-            continue;
-        }
-        let options = DecompilerOptions {
-            mode,
-            // getclass only has DEX bytes, not resources.arsc. Supplying an
-            // empty map avoids an expensive full-DEX R-class discovery pass.
-            resource_map: Some(Default::default()),
-            ..DecompilerOptions::default()
-        };
-        let decompiler = Decompiler::with_options(&parsed, options);
-        let mut source = decompiler
-            .decompile_class(&class_def)
-            .map_err(|error| anyhow::anyhow!(error.to_string()))
-            .with_context(|| format!("failed to decompile {}", descriptor_to_java(descriptor)))?;
-        // dex-decompiler intentionally hides bridge/accessor/R8 shim methods.
-        // ASC's DAD output includes them, so restore those methods for parity.
-        if let Some(class_data) = parsed
-            .get_class_data(&class_def)
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?
-        {
-            let class_name = descriptor_to_java(descriptor);
-            let simple_name = class_name.rsplit('.').next().unwrap_or(&class_name);
-            let mut restored = String::new();
-            for method in class_data
-                .direct_methods
-                .iter()
-                .chain(class_data.virtual_methods.iter())
-            {
-                let info = parsed
-                    .get_method_info(method.method_idx)
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                let hidden = method.access_flags & 0x40 != 0
-                    || (info.name.starts_with("access$") && method.access_flags & 0x1000 != 0)
-                    || info.name.starts_with("$r8$lambda$");
-                if hidden {
-                    restored.push_str(
-                        &decompiler
-                            .decompile_method(method, Some(simple_name), Some(&class_name))
-                            .map_err(|error| anyhow::anyhow!(error.to_string()))?,
-                    );
-                }
-            }
-            if !restored.is_empty() {
-                let insert_at = source.rfind("\n}").unwrap_or(source.len());
-                restored.insert(0, '\n');
-                source.insert_str(insert_at, &restored);
-            }
-        }
-        let decompile_finished = Instant::now();
-        return Ok((
-            repair_double_encoded_utf8(source),
-            minimal.stats,
-            (extract_finished - extract_started).as_secs_f64() * 1000.0,
-            (decompile_finished - extract_finished).as_secs_f64() * 1000.0,
-        ));
-    }
-    bail!("class {descriptor} was located but dex-decompiler could not resolve it")
-}
-
-/// Some current dex-parser strings arrive as UTF-8 bytes decoded through
-/// Latin-1 one or two times. Repair only when a lossless Latin-1 -> UTF-8 pass
-/// strictly reduces the number of suspicious Latin-1 code points.
-fn repair_double_encoded_utf8(mut text: String) -> String {
-    for _ in 0..2 {
-        let suspicious_before = text
-            .chars()
-            .filter(|ch| ('\u{80}'..='\u{ff}').contains(ch))
-            .count();
-        if suspicious_before == 0 || !text.chars().all(|ch| u32::from(ch) <= 0xff) {
-            break;
-        }
-        let bytes: Vec<u8> = text.chars().map(|ch| ch as u8).collect();
-        let Ok(candidate) = String::from_utf8(bytes) else {
-            break;
-        };
-        let suspicious_after = candidate
-            .chars()
-            .filter(|ch| ('\u{80}'..='\u{ff}').contains(ch))
-            .count();
-        if suspicious_after >= suspicious_before {
-            break;
-        }
-        text = candidate;
-    }
-    text
 }
 
 fn member_query(args: MemberArgs) -> Result<MemberQuery> {
@@ -359,68 +201,65 @@ fn member_query(args: MemberArgs) -> Result<MemberQuery> {
 }
 
 fn findrefs(args: FindRefsArgs) -> Result<()> {
-    check_apk(&args.apk_path)?;
-    ensure!(args.common.threads > 0, "--threads must be at least 1");
     let query = match args.query {
         FindQuery::String { value } => Query::String(value),
         FindQuery::Type { value } => Query::Type(value.replace('.', "/")),
         FindQuery::Method(member) => Query::Method(member_query(member)?),
         FindQuery::Field(member) => Query::Field(member_query(member)?),
     };
-    let started = Instant::now();
-    let entries = load_dexes(&args.apk_path, args.common.threads)?;
-    let inflated = Instant::now();
-    let mut lines = Vec::new();
+    let session = AscSession::open(&args.apk_path, args.common.threads)?;
+    let result = session.find_references(&query)?;
 
-    for entry in &entries {
-        let dex =
-            Dex::parse(&entry.data).with_context(|| format!("failed to parse {}", entry.name))?;
-        let matched = dex.matching_indices(&query);
-        let references = dex.scan_references(query.kind(), &matched)?;
-        for (caller_idx, target_idxs) in references {
-            let matches = target_idxs
-                .into_iter()
-                .map(|index| dex.format_match(query.kind(), index))
-                .collect::<Vec<_>>()
-                .join("; ");
-            lines.push(format!(
-                "{} | {} | matched=({matches})",
-                entry.name,
-                dex.format_method(caller_idx)
-            ));
-        }
-        if args.common.debug {
-            eprintln!(
-                "[DEBUG] {} classes={} methods={} matched={}",
-                entry.name,
-                dex.class_count(),
-                dex.method_count(),
-                matched.len()
-            );
-        }
+    let mut grouped = BTreeMap::<(String, u32, String), BTreeSet<String>>::new();
+    for reference in &result.references {
+        grouped
+            .entry((
+                reference.dex_name.clone(),
+                reference.caller_index,
+                reference.caller_method.clone(),
+            ))
+            .or_default()
+            .insert(reference.target_symbol.clone());
     }
-
+    let lines = grouped
+        .into_iter()
+        .map(|((dex_name, _, caller), matches)| {
+            format!(
+                "{dex_name} | {caller} | matched=({})",
+                matches.into_iter().collect::<Vec<_>>().join("; ")
+            )
+        })
+        .collect::<Vec<_>>();
     let text = if lines.is_empty() {
         String::new()
     } else {
         format!("{}\n", lines.join("\n"))
     };
-    print!("{text}");
-    if let Some(output) = &args.output {
+    write_and_print(&text, args.output.as_ref())?;
+
+    if args.common.debug {
+        for dex in &result.dexes {
+            eprintln!(
+                "[DEBUG] {} classes={} methods={} matched={}",
+                dex.dex_name, dex.classes, dex.methods, dex.matched_targets
+            );
+        }
+        eprintln!("[DEBUG] DEX inflate: {:.3} ms", result.timings.load_ms);
+        eprintln!("[DEBUG] DEX scan: {:.3} ms", result.timings.scan_ms);
+        eprintln!("[DEBUG] Total: {:.3} ms", result.timings.total_ms);
+        eprintln!("[DEBUG] Results: {}", lines.len());
+    }
+    Ok(())
+}
+
+fn write_and_print(text: &str, output: Option<&PathBuf>) -> Result<()> {
+    if let Some(output) = output {
         fs::write(output, text.as_bytes())
             .with_context(|| format!("failed to write {}", output.display()))?;
     }
-    if args.common.debug {
-        let finished = Instant::now();
-        eprintln!(
-            "[DEBUG] DEX inflate: {:.3} ms",
-            (inflated - started).as_secs_f64() * 1000.0
-        );
-        eprintln!(
-            "[DEBUG] Total: {:.3} ms",
-            (finished - started).as_secs_f64() * 1000.0
-        );
-        eprintln!("[DEBUG] Results: {}", lines.len());
+    print!("{text}");
+    if !text.is_empty() && !text.ends_with('\n') {
+        println!();
     }
     Ok(())
 }

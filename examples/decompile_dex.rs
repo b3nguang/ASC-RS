@@ -1,4 +1,4 @@
-use std::{env, fs, path::Path, time::Instant};
+use std::{env, fs, path::Path, sync::Arc, time::Instant};
 
 use anyhow::{Context, Result, bail};
 use asc_rs::apk::load_dexes;
@@ -13,13 +13,13 @@ fn main() -> Result<()> {
     let descriptor = descriptor.to_string_lossy();
     let path = Path::new(&path);
     let started = Instant::now();
-    let data = if path
+    let data: Arc<[u8]> = if path
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("apk"))
     {
         load_dexes(path, 8)?.remove(0).data
     } else {
-        fs::read(path)?
+        fs::read(path)?.into()
     };
     let loaded = Instant::now();
     let dex = parse_dex(&data).map_err(|error| anyhow::anyhow!(error.to_string()))?;

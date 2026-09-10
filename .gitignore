@@ -1,0 +1,19 @@
+/target/
+/.venv-*/
+/.apk-inspect/
+
+# External inputs and generated reverse-engineering artifacts
+*.apk
+*.dex
+*.java
+/AndroidManifest.decoded.xml
+/compare-*.txt
+/original-debug-output.java
+/string_refs.txt
+
+# Editor and OS files
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store

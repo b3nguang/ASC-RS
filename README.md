@@ -44,6 +44,14 @@ cargo build --release
 
 The executable is `target/release/asc-rs.exe` on Windows.
 
+## Codex Skill
+
+The repository includes a discoverable Codex skill at
+`.agents/skills/asc-rs`. Launch Codex anywhere inside this repository and invoke
+`$asc-rs`, or describe a focused APK decompilation, reference-search, or
+manifest task and let Codex select it automatically. The layout follows the
+[official OpenAI skill format](https://learn.chatgpt.com/codex/build-skills).
+
 ## Usage
 
 ```powershell

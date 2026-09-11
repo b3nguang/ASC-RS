@@ -1,0 +1,4 @@
+interface:
+  display_name: "ASC-RS APK Analyst"
+  short_description: "Targeted APK decompilation and reference search"
+  default_prompt: "Use $asc-rs to inspect an APK and report the requested class, references, or manifest details."

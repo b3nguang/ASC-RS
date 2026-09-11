@@ -244,7 +244,7 @@ fn findrefs(args: FindRefsArgs) -> Result<()> {
                 dex.dex_name, dex.classes, dex.methods, dex.matched_targets
             );
         }
-        eprintln!("[DEBUG] DEX inflate: {:.3} ms", result.timings.load_ms);
+        eprintln!("[DEBUG] DEX load/parse: {:.3} ms", result.timings.load_ms);
         eprintln!("[DEBUG] DEX scan: {:.3} ms", result.timings.scan_ms);
         eprintln!("[DEBUG] Total: {:.3} ms", result.timings.total_ms);
         eprintln!("[DEBUG] Results: {}", lines.len());

@@ -27,8 +27,12 @@ DEX:
 
 The parser primitives used by reference search and minimal-DEX extraction live
 in one shared format layer. A reusable `AscSession` owns APK metadata, a bounded
-DEX cache, the lazy class index, and its worker pool. This keeps CLI startup
-small while allowing a GUI or other long-lived client to reuse previous work.
+LRU DEX cache, the lazy class index, and its worker pool. Cached entries retain
+parsed metadata, method descriptors, and per-reference-kind bytecode indexes;
+repeated GUI/service queries therefore avoid reinflating, reparsing, and walking
+the same instructions. Concurrent requests for the same entry share one load.
+The bytecode walker reads little-endian code units directly from the DEX buffer
+instead of allocating a temporary instruction vector for every method.
 
 ## Build
 
@@ -81,8 +85,10 @@ let references = session.find_references(
 ```
 
 `OperationObserver` provides thread-safe progress and cancellation callbacks.
-The default session cache owns at most 512 MiB of decompressed DEX data; use
-`AscSession::open_with_cache_limit` to choose another bound.
+The default session cache owns at most 512 MiB of decompressed DEX data; parsed
+metadata and lazy indexes are evicted with their owning DEX. Use
+`AscSession::open_with_cache_limit` to choose another bound, and
+`ApkSession::clear_dex_cache` to explicitly release all cached entries.
 
 See [`BENCHMARK.md`](BENCHMARK.md) for the speed and result-set comparison
 against the original Python ASC on the supplied demo APK.

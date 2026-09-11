@@ -15,7 +15,7 @@ use rayon::prelude::*;
 use crate::{
     apk::{ApkSession, DexEntry},
     descriptor_to_java,
-    dex::{Dex, Query},
+    dex::Query,
     format_class_name,
     minidex::{MinimalDexStats, extract_minimal_dex},
 };
@@ -238,7 +238,7 @@ impl AscSession {
             total: self.apk.dex_info().len(),
             item: None,
         });
-        let entries = self.apk.load_all_dexes()?;
+        let entries = self.apk.load_all_parsed_dexes()?;
         let loaded = Instant::now();
         let total = entries.len();
         observer.on_progress(&ProgressEvent {
@@ -254,8 +254,7 @@ impl AscSession {
                     .par_iter()
                     .map(|entry| {
                         check_cancelled(observer)?;
-                        let dex = Dex::parse(&entry.data)
-                            .with_context(|| format!("failed to parse {}", entry.name))?;
+                        let dex = &entry.dex;
                         let matched = dex.matching_indices(query);
                         let sites = dex.scan_reference_sites(query.kind(), &matched)?;
                         let references = sites

@@ -10,12 +10,18 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use rayon::{ThreadPool, prelude::*};
 use zip::ZipArchive;
 
-use crate::dex::class_descriptors;
+use crate::dex::{Dex, class_descriptors};
 
 #[derive(Debug, Clone)]
 pub struct DexEntry {
     pub name: String,
     pub data: Arc<[u8]>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ParsedDexEntry {
+    pub name: String,
+    pub dex: Arc<Dex>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,9 +38,15 @@ struct ClassIndex {
 }
 
 #[derive(Debug)]
+struct CachedDex {
+    data: Arc<[u8]>,
+    parsed: Option<Arc<Dex>>,
+}
+
+#[derive(Debug)]
 struct DexCache {
-    entries: HashMap<usize, Arc<[u8]>>,
-    insertion_order: VecDeque<usize>,
+    entries: HashMap<usize, CachedDex>,
+    lru_order: VecDeque<usize>,
     bytes: usize,
     max_bytes: usize,
 }
@@ -43,28 +55,64 @@ impl DexCache {
     fn new(max_bytes: usize) -> Self {
         Self {
             entries: HashMap::new(),
-            insertion_order: VecDeque::new(),
+            lru_order: VecDeque::new(),
             bytes: 0,
             max_bytes,
         }
     }
 
-    fn insert(&mut self, index: usize, data: Arc<[u8]>) -> Arc<[u8]> {
-        if let Some(existing) = self.entries.get(&index) {
-            return existing.clone();
+    fn touch(&mut self, index: usize) {
+        self.lru_order.retain(|&cached| cached != index);
+        self.lru_order.push_back(index);
+    }
+
+    fn get_data(&mut self, index: usize) -> Option<Arc<[u8]>> {
+        let data = self.entries.get(&index)?.data.clone();
+        self.touch(index);
+        Some(data)
+    }
+
+    fn get_parsed(&mut self, index: usize) -> Option<Arc<Dex>> {
+        let parsed = self.entries.get(&index)?.parsed.clone()?;
+        self.touch(index);
+        Some(parsed)
+    }
+
+    fn insert_data(&mut self, index: usize, data: Arc<[u8]>) -> Arc<[u8]> {
+        if let Some(existing) = self.entries.get(&index).map(|entry| entry.data.clone()) {
+            self.touch(index);
+            return existing;
         }
         self.bytes = self.bytes.saturating_add(data.len());
-        self.insertion_order.push_back(index);
-        self.entries.insert(index, data.clone());
+        self.touch(index);
+        self.entries.insert(
+            index,
+            CachedDex {
+                data: data.clone(),
+                parsed: None,
+            },
+        );
         while self.bytes > self.max_bytes && self.entries.len() > 1 {
-            let Some(oldest) = self.insertion_order.pop_front() else {
+            let Some(oldest) = self.lru_order.pop_front() else {
                 break;
             };
             if let Some(removed) = self.entries.remove(&oldest) {
-                self.bytes = self.bytes.saturating_sub(removed.len());
+                self.bytes = self.bytes.saturating_sub(removed.data.len());
             }
         }
         data
+    }
+
+    fn insert_parsed(&mut self, index: usize, data: Arc<[u8]>, parsed: Arc<Dex>) -> Arc<Dex> {
+        self.insert_data(index, data);
+        if let Some(existing) = self.entries[&index].parsed.clone() {
+            return existing;
+        }
+        self.entries
+            .get_mut(&index)
+            .expect("newly inserted DEX must remain cached")
+            .parsed = Some(parsed.clone());
+        parsed
     }
 }
 
@@ -74,6 +122,7 @@ pub struct ApkSession {
     dexes: Vec<DexInfo>,
     pool: ThreadPool,
     cache: Mutex<DexCache>,
+    load_locks: Vec<Mutex<()>>,
     class_index: RwLock<ClassIndex>,
 }
 
@@ -152,6 +201,7 @@ impl ApkSession {
         ensure!(path.is_file(), "APK does not exist: {}", path.display());
         let dexes = dex_metadata(&path)?;
         let workers = threads.min(dexes.len().max(1));
+        let load_locks = (0..dexes.len()).map(|_| Mutex::new(())).collect();
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(workers)
             .build()
@@ -161,6 +211,7 @@ impl ApkSession {
             dexes,
             pool,
             cache: Mutex::new(DexCache::new(max_cached_bytes)),
+            load_locks,
             class_index: RwLock::new(ClassIndex::default()),
         })
     }
@@ -184,6 +235,19 @@ impl ApkSession {
         self.cache.lock().map(|cache| cache.bytes).unwrap_or(0)
     }
 
+    pub fn cached_parsed_dex_count(&self) -> usize {
+        self.cache
+            .lock()
+            .map(|cache| {
+                cache
+                    .entries
+                    .values()
+                    .filter(|entry| entry.parsed.is_some())
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     pub fn clear_dex_cache(&self) -> Result<()> {
         let mut cache = self
             .cache
@@ -203,9 +267,7 @@ impl ApkSession {
             .cache
             .lock()
             .map_err(|_| anyhow!("DEX cache lock was poisoned"))?
-            .entries
-            .get(&index)
-            .cloned()
+            .get_data(index)
         {
             return Ok(DexEntry {
                 name: info.name.clone(),
@@ -213,15 +275,95 @@ impl ApkSession {
             });
         }
 
+        let _load_guard = self.load_locks[index]
+            .lock()
+            .map_err(|_| anyhow!("DEX load lock was poisoned"))?;
+        if let Some(data) = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow!("DEX cache lock was poisoned"))?
+            .get_data(index)
+        {
+            return Ok(DexEntry {
+                name: info.name.clone(),
+                data,
+            });
+        }
         let loaded = read_one(&self.path, info)?;
         let data = self
             .cache
             .lock()
             .map_err(|_| anyhow!("DEX cache lock was poisoned"))?
-            .insert(index, loaded);
+            .insert_data(index, loaded);
         Ok(DexEntry {
             name: info.name.clone(),
             data,
+        })
+    }
+
+    fn load_parsed_dex_index(&self, index: usize) -> Result<ParsedDexEntry> {
+        let info = self
+            .dexes
+            .get(index)
+            .with_context(|| format!("invalid DEX entry index {index}"))?;
+        if let Some(dex) = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow!("DEX cache lock was poisoned"))?
+            .get_parsed(index)
+        {
+            return Ok(ParsedDexEntry {
+                name: info.name.clone(),
+                dex,
+            });
+        }
+
+        // The per-entry barrier prevents concurrent UI/service queries from
+        // inflating and parsing the same DEX more than once.
+        let _load_guard = self.load_locks[index]
+            .lock()
+            .map_err(|_| anyhow!("DEX load lock was poisoned"))?;
+        if let Some(dex) = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow!("DEX cache lock was poisoned"))?
+            .get_parsed(index)
+        {
+            return Ok(ParsedDexEntry {
+                name: info.name.clone(),
+                dex,
+            });
+        }
+
+        let cached_data = {
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|_| anyhow!("DEX cache lock was poisoned"))?;
+            cache.get_data(index)
+        };
+        let data = match cached_data {
+            Some(data) => data,
+            None => {
+                let loaded = read_one(&self.path, info)?;
+                self.cache
+                    .lock()
+                    .map_err(|_| anyhow!("DEX cache lock was poisoned"))?
+                    .insert_data(index, loaded)
+            }
+        };
+        let parsed = Arc::new(
+            Dex::parse_shared(data.clone())
+                .with_context(|| format!("failed to parse {}", info.name))?,
+        );
+        let dex = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow!("DEX cache lock was poisoned"))?
+            .insert_parsed(index, data, parsed);
+        Ok(ParsedDexEntry {
+            name: info.name.clone(),
+            dex,
         })
     }
 
@@ -239,6 +381,16 @@ impl ApkSession {
             (0..self.dexes.len())
                 .into_par_iter()
                 .map(|index| self.load_dex_index(index))
+                .collect()
+        });
+        entries.into_iter().collect()
+    }
+
+    pub(crate) fn load_all_parsed_dexes(&self) -> Result<Vec<ParsedDexEntry>> {
+        let entries: Vec<Result<ParsedDexEntry>> = self.pool.install(|| {
+            (0..self.dexes.len())
+                .into_par_iter()
+                .map(|index| self.load_parsed_dex_index(index))
                 .collect()
         });
         entries.into_iter().collect()
@@ -327,6 +479,39 @@ pub fn load_dexes(apk_path: &Path, threads: usize) -> Result<Vec<DexEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::Write,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    struct TempApk(PathBuf);
+
+    impl Drop for TempApk {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn empty_dex_apk() -> TempApk {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "asc-rs-cache-test-{}-{unique}.apk",
+            std::process::id()
+        ));
+        let file = File::create(&path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        archive
+            .start_file("classes.dex", zip::write::FileOptions::default())
+            .unwrap();
+        let mut dex = vec![0; 0x70];
+        dex[..8].copy_from_slice(b"dex\n035\0");
+        archive.write_all(&dex).unwrap();
+        archive.finish().unwrap();
+        TempApk(path)
+    }
 
     #[test]
     fn recognizes_root_dex_names() {
@@ -341,10 +526,39 @@ mod tests {
         let mut cache = DexCache::new(6);
         let first: Arc<[u8]> = vec![1; 4].into();
         let second: Arc<[u8]> = vec![2; 4].into();
-        cache.insert(0, first);
-        cache.insert(1, second);
+        cache.insert_data(0, first);
+        cache.insert_data(1, second);
         assert_eq!(cache.entries.len(), 1);
         assert!(cache.entries.contains_key(&1));
         assert_eq!(cache.bytes, 4);
+    }
+
+    #[test]
+    fn dex_cache_evicts_the_least_recently_used_entry() {
+        let mut cache = DexCache::new(6);
+        cache.insert_data(0, vec![0; 3].into());
+        cache.insert_data(1, vec![1; 3].into());
+        assert!(cache.get_data(0).is_some());
+        cache.insert_data(2, vec![2; 3].into());
+        assert!(cache.entries.contains_key(&0));
+        assert!(!cache.entries.contains_key(&1));
+        assert!(cache.entries.contains_key(&2));
+    }
+
+    #[test]
+    fn concurrent_queries_share_one_parsed_dex() {
+        let apk = empty_dex_apk();
+        let session = ApkSession::open(&apk.0, 4).unwrap();
+        let parsed = std::thread::scope(|scope| {
+            let handles = (0..4)
+                .map(|_| scope.spawn(|| session.load_all_parsed_dexes().unwrap().remove(0).dex))
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(parsed[1..].iter().all(|dex| Arc::ptr_eq(&parsed[0], dex)));
+        assert_eq!(session.cached_parsed_dex_count(), 1);
     }
 }

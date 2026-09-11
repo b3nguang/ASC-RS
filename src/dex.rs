@@ -1,11 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    sync::{Arc, OnceLock},
+};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 
 use crate::dex_format::{
-    DexHeader as Header, FieldId, MethodId, ProtoId, bytes_at as get_bytes, instruction_width,
-    read_field_ids, read_method_ids, read_proto_ids, read_string, read_strings, read_type_list,
-    read_types, read_uleb, u32_at,
+    DexHeader as Header, FieldId, MethodId, ProtoId, bytes_at as get_bytes,
+    instruction_width_bytes, read_field_ids, read_method_ids, read_proto_ids, read_string,
+    read_strings, read_type_list, read_types, read_uleb, u32_at,
 };
 
 #[cfg(test)]
@@ -53,8 +56,14 @@ struct CodeItem {
 }
 
 #[derive(Debug)]
-pub struct Dex<'a> {
-    data: &'a [u8],
+struct ReferenceIndex {
+    /// Sites sorted by target index, then caller and code-unit offset.
+    sites: Box<[ReferenceSite]>,
+}
+
+#[derive(Debug)]
+pub struct Dex {
+    data: Arc<[u8]>,
     header: Header,
     strings: Vec<String>,
     types: Vec<u32>,
@@ -63,30 +72,40 @@ pub struct Dex<'a> {
     methods: Vec<MethodId>,
     class_type_indices: Vec<u32>,
     code_items: Vec<CodeItem>,
+    method_scan_order: Vec<u32>,
+    reference_indexes: [OnceLock<Result<ReferenceIndex, String>>; 4],
+    method_descriptors: Vec<OnceLock<Result<String, String>>>,
 }
 
-impl<'a> Dex<'a> {
-    pub fn parse(data: &'a [u8]) -> Result<Self> {
-        let header = Header::parse(data)?;
-        let strings = read_strings(data, &header)?;
-        let types = read_types(data, &header)?;
-        let protos = read_proto_ids(data, &header)?;
-        let fields = read_field_ids(data, &header)?;
-        let methods = read_method_ids(data, &header)?;
+impl Dex {
+    /// Parse borrowed bytes into a self-contained DEX. Prefer `parse_shared`
+    /// when the caller already owns the data in an `Arc` to avoid a copy.
+    pub fn parse(data: &[u8]) -> Result<Self> {
+        Self::parse_shared(Arc::from(data))
+    }
+
+    pub fn parse_shared(data: Arc<[u8]>) -> Result<Self> {
+        let header = Header::parse(&data)?;
+        let strings = read_strings(&data, &header)?;
+        let types = read_types(&data, &header)?;
+        let protos = read_proto_ids(&data, &header)?;
+        let fields = read_field_ids(&data, &header)?;
+        let methods = read_method_ids(&data, &header)?;
 
         let mut class_type_indices = Vec::with_capacity(header.class_defs_size as usize);
         let mut class_data_offsets = Vec::with_capacity(header.class_defs_size as usize);
         for index in 0..header.class_defs_size as usize {
             let offset = header.class_defs_off as usize + index * 32;
-            let class_idx = u32_at(data, offset)?;
+            let class_idx = u32_at(&data, offset)?;
             ensure!(
                 class_idx < header.type_ids_size,
                 "class #{index} has invalid type index"
             );
             class_type_indices.push(class_idx);
-            class_data_offsets.push(u32_at(data, offset + 24)?);
+            class_data_offsets.push(u32_at(&data, offset + 24)?);
         }
 
+        let method_descriptor_count = methods.len();
         let mut dex = Self {
             data,
             header,
@@ -97,6 +116,11 @@ impl<'a> Dex<'a> {
             methods,
             class_type_indices,
             code_items: Vec::new(),
+            method_scan_order: vec![u32::MAX; method_descriptor_count],
+            reference_indexes: std::array::from_fn(|_| OnceLock::new()),
+            method_descriptors: (0..method_descriptor_count)
+                .map(|_| OnceLock::new())
+                .collect(),
         };
         for offset in class_data_offsets {
             if offset != 0 {
@@ -108,24 +132,27 @@ impl<'a> Dex<'a> {
 
     fn parse_class_data(&mut self, offset: usize) -> Result<()> {
         let mut cursor = offset;
-        let static_fields = read_uleb(self.data, &mut cursor)?;
-        let instance_fields = read_uleb(self.data, &mut cursor)?;
-        let direct_methods = read_uleb(self.data, &mut cursor)?;
-        let virtual_methods = read_uleb(self.data, &mut cursor)?;
+        let static_fields = read_uleb(&self.data, &mut cursor)?;
+        let instance_fields = read_uleb(&self.data, &mut cursor)?;
+        let direct_methods = read_uleb(&self.data, &mut cursor)?;
+        let virtual_methods = read_uleb(&self.data, &mut cursor)?;
 
-        for _ in 0..static_fields + instance_fields {
-            let _field_idx_diff = read_uleb(self.data, &mut cursor)?;
-            let _access_flags = read_uleb(self.data, &mut cursor)?;
+        let field_count = static_fields
+            .checked_add(instance_fields)
+            .context("encoded field count overflow")?;
+        for _ in 0..field_count {
+            let _field_idx_diff = read_uleb(&self.data, &mut cursor)?;
+            let _access_flags = read_uleb(&self.data, &mut cursor)?;
         }
 
         for count in [direct_methods, virtual_methods] {
             let mut method_idx = 0u32;
             for _ in 0..count {
                 method_idx = method_idx
-                    .checked_add(read_uleb(self.data, &mut cursor)?)
+                    .checked_add(read_uleb(&self.data, &mut cursor)?)
                     .context("method index overflow in class_data_item")?;
-                let _access_flags = read_uleb(self.data, &mut cursor)?;
-                let code_offset = read_uleb(self.data, &mut cursor)? as usize;
+                let _access_flags = read_uleb(&self.data, &mut cursor)?;
+                let code_offset = read_uleb(&self.data, &mut cursor)? as usize;
                 ensure!(
                     method_idx < self.header.method_ids_size,
                     "invalid encoded method index"
@@ -133,9 +160,15 @@ impl<'a> Dex<'a> {
                 if code_offset == 0 {
                     continue;
                 }
-                let insns_size = u32_at(self.data, code_offset + 12)? as usize;
+                let insns_size = u32_at(&self.data, code_offset + 12)? as usize;
                 let insns_offset = code_offset + 16;
-                get_bytes(self.data, insns_offset, insns_size.saturating_mul(2))?;
+                let insns_bytes = insns_size
+                    .checked_mul(2)
+                    .context("code item size overflow")?;
+                get_bytes(&self.data, insns_offset, insns_bytes)?;
+                let scan_order =
+                    u32::try_from(self.code_items.len()).context("too many code items to index")?;
+                self.method_scan_order[method_idx as usize] = scan_order;
                 self.code_items.push(CodeItem {
                     method_idx,
                     insns_offset,
@@ -221,37 +254,78 @@ impl<'a> Dex<'a> {
         kind: ReferenceKind,
         targets: &HashSet<u32>,
     ) -> Result<Vec<ReferenceSite>> {
-        let mut results = Vec::new();
         if targets.is_empty() {
-            return Ok(results);
+            return Ok(Vec::new());
         }
+        let index = self.reference_index(kind)?;
+        let mut results = Vec::new();
+        for &target in targets {
+            let start = index
+                .sites
+                .partition_point(|site| site.target_index < target);
+            let end = index
+                .sites
+                .partition_point(|site| site.target_index <= target);
+            results.extend_from_slice(&index.sites[start..end]);
+        }
+        results.sort_unstable_by_key(|site| {
+            (
+                self.method_scan_order
+                    .get(site.caller_index as usize)
+                    .copied()
+                    .unwrap_or(u32::MAX),
+                site.code_unit_offset,
+                site.target_index,
+            )
+        });
+        Ok(results)
+    }
+
+    fn reference_index(&self, kind: ReferenceKind) -> Result<&ReferenceIndex> {
+        let cached = self.reference_indexes[kind.slot()].get_or_init(|| {
+            self.build_reference_index(kind)
+                .map_err(|error| format!("{error:#}"))
+        });
+        cached
+            .as_ref()
+            .map_err(|message| anyhow!(message.to_owned()))
+    }
+
+    fn build_reference_index(&self, kind: ReferenceKind) -> Result<ReferenceIndex> {
+        let mut sites = Vec::new();
         for code in &self.code_items {
-            let bytes = get_bytes(self.data, code.insns_offset, code.insns_size * 2)?;
-            let mut units = Vec::with_capacity(code.insns_size);
-            for pair in bytes.chunks_exact(2) {
-                units.push(u16::from_le_bytes([pair[0], pair[1]]));
-            }
+            let insns_bytes = code
+                .insns_size
+                .checked_mul(2)
+                .context("code item size overflow")?;
+            let bytes = get_bytes(&self.data, code.insns_offset, insns_bytes)?;
             let mut pc = 0usize;
-            while pc < units.len() {
-                let opcode = (units[pc] & 0xff) as u8;
-                if let Some(index) = reference_index(kind, opcode, &units, pc)
-                    && targets.contains(&index)
-                {
-                    results.push(ReferenceSite {
+            while pc < code.insns_size {
+                let opcode = (code_unit(bytes, pc)? & 0xff) as u8;
+                if let Some(index) = reference_index(kind, opcode, bytes, pc) {
+                    sites.push(ReferenceSite {
                         caller_index: code.method_idx,
                         target_index: index,
                         code_unit_offset: pc as u32,
                     });
                 }
-                let width = instruction_width(&units, pc)?;
+                let width = instruction_width_bytes(bytes, pc)?;
+                let next = pc
+                    .checked_add(width)
+                    .context("instruction offset overflow")?;
                 ensure!(
-                    width > 0 && pc + width <= units.len(),
+                    width > 0 && next <= code.insns_size,
                     "invalid instruction width at code unit {pc}"
                 );
-                pc += width;
+                pc = next;
             }
         }
-        Ok(results)
+        sites.sort_unstable_by_key(|site| {
+            (site.target_index, site.caller_index, site.code_unit_offset)
+        });
+        Ok(ReferenceIndex {
+            sites: sites.into_boxed_slice(),
+        })
     }
 
     pub fn scan_references(
@@ -275,16 +349,28 @@ impl<'a> Dex<'a> {
     }
 
     pub fn try_format_method(&self, index: u32) -> Result<String> {
-        let method = self
-            .methods
+        let descriptor = self
+            .method_descriptors
             .get(index as usize)
-            .with_context(|| format!("invalid method index {index}"))?;
+            .with_context(|| format!("invalid method index {index}"))?
+            .get_or_init(|| {
+                self.build_method_descriptor(index)
+                    .map_err(|error| format!("{error:#}"))
+            });
+        descriptor
+            .as_ref()
+            .cloned()
+            .map_err(|message| anyhow!(message.to_owned()))
+    }
+
+    fn build_method_descriptor(&self, index: u32) -> Result<String> {
+        let method = &self.methods[index as usize];
         let proto = self
             .protos
             .get(method.proto_idx as usize)
             .with_context(|| format!("invalid proto index {}", method.proto_idx))?;
         let parameters =
-            read_type_list(self.data, proto.parameters_off, self.header.type_ids_size)?
+            read_type_list(&self.data, proto.parameters_off, self.header.type_ids_size)?
                 .into_iter()
                 .map(|type_idx| self.type_descriptor(u32::from(type_idx)))
                 .collect::<String>();
@@ -328,6 +414,15 @@ impl<'a> Dex<'a> {
 }
 
 impl ReferenceKind {
+    fn slot(self) -> usize {
+        match self {
+            Self::String => 0,
+            Self::Type => 1,
+            Self::Method => 2,
+            Self::Field => 3,
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::String => "string",
@@ -363,13 +458,20 @@ pub fn class_descriptors(data: &[u8]) -> Result<Vec<String>> {
     Ok(result)
 }
 
-fn reference_index(kind: ReferenceKind, opcode: u8, units: &[u16], pc: usize) -> Option<u32> {
-    let short = || units.get(pc + 1).copied().map(u32::from);
+fn code_unit(bytes: &[u8], pc: usize) -> Result<u16> {
+    let offset = pc.checked_mul(2).context("code unit offset overflow")?;
+    let pair = get_bytes(bytes, offset, 2)?;
+    Ok(u16::from_le_bytes([pair[0], pair[1]]))
+}
+
+fn reference_index(kind: ReferenceKind, opcode: u8, bytes: &[u8], pc: usize) -> Option<u32> {
+    let short = || code_unit(bytes, pc + 1).ok().map(u32::from);
     match kind {
         ReferenceKind::String if opcode == 0x1a => short(),
-        ReferenceKind::String if opcode == 0x1b => {
-            Some(u32::from(*units.get(pc + 1)?) | (u32::from(*units.get(pc + 2)?) << 16))
-        }
+        ReferenceKind::String if opcode == 0x1b => Some(
+            u32::from(code_unit(bytes, pc + 1).ok()?)
+                | (u32::from(code_unit(bytes, pc + 2).ok()?) << 16),
+        ),
         ReferenceKind::Type if matches!(opcode, 0x1c | 0x1f | 0x20 | 0x22..=0x25) => short(),
         ReferenceKind::Field if (0x52..=0x6d).contains(&opcode) => short(),
         ReferenceKind::Method if matches!(opcode, 0x6e..=0x72 | 0x74..=0x78 | 0xfa | 0xfb) => {
@@ -382,6 +484,7 @@ fn reference_index(kind: ReferenceKind, opcode: u8, units: &[u16], pc: usize) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dex_format::instruction_width;
 
     #[test]
     fn decodes_modified_utf8() {
@@ -392,10 +495,37 @@ mod tests {
 
     #[test]
     fn understands_payload_widths() {
+        for (units, expected) in [
+            (vec![0x0100, 2, 0, 0, 0, 0, 0, 0], 8),
+            (vec![0x0300, 1, 3, 0, 0, 0], 6),
+        ] {
+            let bytes = units
+                .iter()
+                .flat_map(|unit| u16::to_le_bytes(*unit))
+                .collect::<Vec<_>>();
+            assert_eq!(instruction_width(&units, 0).unwrap(), expected);
+            assert_eq!(instruction_width_bytes(&bytes, 0).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn reads_reference_operands_directly_from_dex_bytes() {
+        let jumbo = [0x001b_u16, 0x5678, 0x1234]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
         assert_eq!(
-            instruction_width(&[0x0100, 2, 0, 0, 0, 0, 0, 0], 0).unwrap(),
-            8
+            reference_index(ReferenceKind::String, 0x1b, &jumbo, 0),
+            Some(0x1234_5678)
         );
-        assert_eq!(instruction_width(&[0x0300, 1, 3, 0, 0, 0], 0).unwrap(), 6);
+
+        let invoke = [0x006e_u16, 0xabcd, 0]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reference_index(ReferenceKind::Method, 0x6e, &invoke, 0),
+            Some(0xabcd)
+        );
     }
 }

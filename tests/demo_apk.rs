@@ -35,7 +35,7 @@ fn external_demo_apk_class_and_string_reference() {
     let mut found_reference = false;
     let mut class_entry = None;
     for entry in entries {
-        let dex = Dex::parse(&entry.data).expect("parse test DEX");
+        let dex = Dex::parse_shared(entry.data.clone()).expect("parse test DEX");
         if dex.defines_class("Lcom/zj/wuaipojie/ui/MainActivity;") {
             found_class = true;
             class_entry = Some(entry.data.clone());
@@ -119,9 +119,12 @@ fn external_demo_apk_class_and_string_reference() {
     }
 
     let asc = AscSession::open(Path::new(&path), 4).expect("open service session");
+    assert_eq!(asc.apk().cached_parsed_dex_count(), 0);
+    let service_query = Query::String("请先注册id".to_owned());
     let search = asc
-        .find_references(&Query::String("请先注册id".to_owned()))
+        .find_references(&service_query)
         .expect("search through service API");
+    assert_eq!(asc.apk().cached_parsed_dex_count(), 1);
     assert!(
         search.references.iter().any(|reference| {
             reference.caller_method.contains("alertFirst()V")
@@ -129,6 +132,15 @@ fn external_demo_apk_class_and_string_reference() {
                 && reference.code_unit_offset > 0
         }),
         "structured service result should retain signature, target, and offset"
+    );
+    let warm_search = asc
+        .find_references(&service_query)
+        .expect("reuse parsed DEX and reference index");
+    assert_eq!(warm_search.references.len(), search.references.len());
+    assert_eq!(asc.apk().cached_parsed_dex_count(), 1);
+    eprintln!(
+        "reference search cold={:.3} ms warm={:.3} ms",
+        search.timings.total_ms, warm_search.timings.total_ms
     );
     let decompiled = asc
         .decompile_class(

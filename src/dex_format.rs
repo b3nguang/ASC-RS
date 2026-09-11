@@ -276,36 +276,37 @@ pub(crate) fn read_type_list(data: &[u8], offset: u32, type_count: u32) -> Resul
     Ok(result)
 }
 
-pub(crate) fn instruction_width(units: &[u16], pc: usize) -> Result<usize> {
-    let unit = *units.get(pc).context("instruction starts past code item")?;
+fn instruction_width_with(
+    pc: usize,
+    mut unit_at: impl FnMut(usize) -> Result<u16>,
+) -> Result<usize> {
+    let unit = unit_at(pc)?;
     let opcode = (unit & 0xff) as u8;
     if opcode == 0 {
         return match unit >> 8 {
             0 => Ok(1),
             1 => {
-                let size = usize::from(
-                    *units
-                        .get(pc + 1)
-                        .context("truncated packed-switch payload")?,
-                );
+                let size = usize::from(unit_at(pc + 1).context("truncated packed-switch payload")?);
                 Ok(4 + size * 2)
             }
             2 => {
-                let size = usize::from(
-                    *units
-                        .get(pc + 1)
-                        .context("truncated sparse-switch payload")?,
-                );
+                let size = usize::from(unit_at(pc + 1).context("truncated sparse-switch payload")?);
                 Ok(2 + size * 4)
             }
             3 => {
                 let element_width =
-                    usize::from(*units.get(pc + 1).context("truncated fill-array payload")?);
-                let low = u32::from(*units.get(pc + 2).context("truncated fill-array payload")?);
-                let high = u32::from(*units.get(pc + 3).context("truncated fill-array payload")?);
+                    usize::from(unit_at(pc + 1).context("truncated fill-array payload")?);
+                let low = u32::from(unit_at(pc + 2).context("truncated fill-array payload")?);
+                let high = u32::from(unit_at(pc + 3).context("truncated fill-array payload")?);
                 let size =
                     usize::try_from(low | (high << 16)).context("fill-array size overflow")?;
-                Ok(4 + element_width.saturating_mul(size).div_ceil(2))
+                let data_units = element_width
+                    .checked_mul(size)
+                    .context("fill-array payload size overflow")?
+                    .div_ceil(2);
+                4usize
+                    .checked_add(data_units)
+                    .context("fill-array payload size overflow")
             }
             ident => bail!("unknown DEX payload identifier 0x{ident:02x}"),
         };
@@ -355,4 +356,29 @@ pub(crate) fn instruction_width(units: &[u16], pc: usize) -> Result<usize> {
         0x00 => unreachable!(),
     };
     Ok(width)
+}
+
+pub(crate) fn instruction_width(units: &[u16], pc: usize) -> Result<usize> {
+    instruction_width_with(pc, |index| {
+        units
+            .get(index)
+            .copied()
+            .context("instruction starts past code item")
+    })
+}
+
+/// Resolve an instruction width directly from little-endian DEX bytes. Search
+/// hot paths use this to avoid allocating and filling a temporary `Vec<u16>`
+/// for every method body.
+pub(crate) fn instruction_width_bytes(bytes: &[u8], pc: usize) -> Result<usize> {
+    if !bytes.len().is_multiple_of(2) {
+        bail!("code item has an odd byte length");
+    }
+    instruction_width_with(pc, |index| {
+        let offset = index.checked_mul(2).context("code unit offset overflow")?;
+        let pair = bytes
+            .get(offset..offset.saturating_add(2))
+            .context("instruction starts past code item")?;
+        Ok(u16::from_le_bytes([pair[0], pair[1]]))
+    })
 }

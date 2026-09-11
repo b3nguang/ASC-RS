@@ -138,6 +138,70 @@ fn external_demo_apk_class_and_string_reference() {
         .expect("reuse parsed DEX and reference index");
     assert_eq!(warm_search.references.len(), search.references.len());
     assert_eq!(asc.apk().cached_parsed_dex_count(), 1);
+
+    let patterns = vec![
+        "请先注册id".to_owned(),
+        "alert".to_owned(),
+        "not-a-real-demo-string".to_owned(),
+        "请先注册id".to_owned(),
+    ];
+    let batch = asc
+        .find_string_references_batch(&patterns)
+        .expect("batch search through service API");
+    assert_eq!(batch.groups.len(), patterns.len());
+    let mut individual_total_ms = 0.0;
+    for group in &batch.groups {
+        let individual = asc
+            .find_references(&Query::String(group.pattern.clone()))
+            .expect("compare individual string search");
+        assert_eq!(group.references, individual.references);
+        individual_total_ms += individual.timings.total_ms;
+    }
+    eprintln!(
+        "four string queries batch={:.3} ms individual-total={individual_total_ms:.3} ms",
+        batch.timings.total_ms
+    );
+    let many_patterns = (0..64)
+        .map(|index| format!("not-a-real-demo-string-{index}"))
+        .collect::<Vec<_>>();
+    let small_miss_batch = asc
+        .find_string_references_batch(&many_patterns[..4])
+        .expect("small no-match batch search");
+    let small_miss_individual_ms = many_patterns[..4]
+        .iter()
+        .map(|pattern| {
+            asc.find_references(&Query::String(pattern.clone()))
+                .expect("compare small no-match batch")
+                .timings
+                .total_ms
+        })
+        .sum::<f64>();
+    eprintln!(
+        "four no-match queries batch={:.3} ms individual-total={small_miss_individual_ms:.3} ms",
+        small_miss_batch.timings.total_ms
+    );
+    let many_batch = asc
+        .find_string_references_batch(&many_patterns)
+        .expect("large batch search through service API");
+    assert!(
+        many_batch
+            .groups
+            .iter()
+            .all(|group| group.references.is_empty())
+    );
+    let many_individual_ms = many_patterns
+        .iter()
+        .map(|pattern| {
+            asc.find_references(&Query::String(pattern.clone()))
+                .expect("compare large batch to individual searches")
+                .timings
+                .total_ms
+        })
+        .sum::<f64>();
+    eprintln!(
+        "64 string queries batch={:.3} ms individual-total={many_individual_ms:.3} ms",
+        many_batch.timings.total_ms
+    );
     eprintln!(
         "reference search cold={:.3} ms warm={:.3} ms",
         search.timings.total_ms, warm_search.timings.total_ms

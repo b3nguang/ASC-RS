@@ -78,6 +78,7 @@ name = "asc-rs"
 version = "0.1.0"
 dependencies = [
  "adler2",
+ "aho-corasick",
  "anyhow",
  "axml-parser",
  "clap",

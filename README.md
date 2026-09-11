@@ -47,6 +47,7 @@ The executable is `target/release/asc-rs.exe` on Windows.
 ```powershell
 asc-rs getclass app.apk com.example.Main -o Main.java
 asc-rs findrefs app.apk string Authorization
+asc-rs findrefs app.apk strings Authorization token api.example.com
 asc-rs findrefs app.apk type com.example.Main
 asc-rs findrefs app.apk method onCreate --class com.example.Main
 asc-rs findrefs app.apk method notify --class openclaw --fuzzy-class
@@ -58,6 +59,11 @@ Use `--debug` for per-DEX counts and timings, and `--threads N` to choose the
 number of DEX inflation and search workers. `getclass` defaults to the fast `simple`
 decompilation strategy; use `-m restructure` for more structured output or
 `-m fallback` for a linear representation of difficult bytecode.
+
+The `strings` form accepts one or more patterns and scans each DEX string table
+once with a shared multi-pattern matcher. Its output stays grouped by query;
+overlapping, repeated, and empty patterns have the same semantics as separate
+`string` searches.
 
 Reference results include complete Dalvik method and field signatures. The
 library's structured results additionally retain the caller and target indexes
@@ -81,6 +87,10 @@ let class = session.decompile_class(
 let references = session.find_references(
     &Query::String("Authorization".to_owned()),
 )?;
+let batch = session.find_string_references_batch(&[
+    "Authorization".to_owned(),
+    "token".to_owned(),
+])?;
 # Ok::<(), anyhow::Error>(())
 ```
 

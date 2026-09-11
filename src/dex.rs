@@ -1,8 +1,9 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{Arc, OnceLock},
 };
 
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use anyhow::{Context, Result, anyhow, ensure};
 
 use crate::dex_format::{
@@ -35,6 +36,83 @@ pub enum Query {
     Type(String),
     Method(MemberQuery),
     Field(MemberQuery),
+}
+
+/// Reusable multi-pattern matcher for one batch of string queries.
+///
+/// Duplicate and empty queries are kept as distinct result groups even though
+/// only unique, non-empty patterns are added to the automaton.
+pub(crate) struct StringBatchMatcher {
+    automaton: Option<AhoCorasick>,
+    unique_to_queries: Vec<Vec<usize>>,
+    empty_queries: Vec<usize>,
+    query_count: usize,
+}
+
+impl StringBatchMatcher {
+    pub(crate) fn new(patterns: &[String]) -> Result<Self> {
+        let mut unique_patterns = Vec::<&str>::new();
+        let mut unique_to_queries = Vec::<Vec<usize>>::new();
+        let mut unique_ids = HashMap::<&str, usize>::new();
+        let mut empty_queries = Vec::new();
+
+        for (query_index, pattern) in patterns.iter().enumerate() {
+            if pattern.is_empty() {
+                empty_queries.push(query_index);
+                continue;
+            }
+            if let Some(&unique_index) = unique_ids.get(pattern.as_str()) {
+                unique_to_queries[unique_index].push(query_index);
+            } else {
+                let unique_index = unique_patterns.len();
+                unique_patterns.push(pattern);
+                unique_to_queries.push(vec![query_index]);
+                unique_ids.insert(pattern, unique_index);
+            }
+        }
+
+        let automaton = if unique_patterns.is_empty() {
+            None
+        } else {
+            Some(
+                AhoCorasickBuilder::new()
+                    .match_kind(MatchKind::Standard)
+                    .build(&unique_patterns)?,
+            )
+        };
+        Ok(Self {
+            automaton,
+            unique_to_queries,
+            empty_queries,
+            query_count: patterns.len(),
+        })
+    }
+
+    pub(crate) fn matching_indices(&self, strings: &[String]) -> Vec<Vec<u32>> {
+        let mut results = vec![Vec::new(); self.query_count];
+        let mut last_seen = vec![usize::MAX; self.unique_to_queries.len()];
+
+        for (string_index, value) in strings.iter().enumerate() {
+            let string_index_u32 = string_index as u32;
+            for &query_index in &self.empty_queries {
+                results[query_index].push(string_index_u32);
+            }
+            let Some(automaton) = &self.automaton else {
+                continue;
+            };
+            for matched in automaton.find_overlapping_iter(value) {
+                let unique_index = matched.pattern().as_usize();
+                if last_seen[unique_index] == string_index {
+                    continue;
+                }
+                last_seen[unique_index] = string_index;
+                for &query_index in &self.unique_to_queries[unique_index] {
+                    results[query_index].push(string_index_u32);
+                }
+            }
+        }
+        results
+    }
 }
 
 impl Query {
@@ -233,6 +311,13 @@ impl Dex {
         }
     }
 
+    pub(crate) fn matching_string_indices_batch(
+        &self,
+        matcher: &StringBatchMatcher,
+    ) -> Vec<Vec<u32>> {
+        matcher.matching_indices(&self.strings)
+    }
+
     fn member_matches(&self, class_idx: u16, name_idx: u32, query: &MemberQuery) -> bool {
         let name_matches = query
             .name
@@ -254,9 +339,20 @@ impl Dex {
         kind: ReferenceKind,
         targets: &HashSet<u32>,
     ) -> Result<Vec<ReferenceSite>> {
+        let mut targets = targets.iter().copied().collect::<Vec<_>>();
+        targets.sort_unstable();
+        self.scan_reference_sites_sorted(kind, &targets)
+    }
+
+    pub(crate) fn scan_reference_sites_sorted(
+        &self,
+        kind: ReferenceKind,
+        targets: &[u32],
+    ) -> Result<Vec<ReferenceSite>> {
         if targets.is_empty() {
             return Ok(Vec::new());
         }
+        debug_assert!(targets.windows(2).all(|pair| pair[0] < pair[1]));
         let index = self.reference_index(kind)?;
         let mut results = Vec::new();
         for &target in targets {
@@ -526,6 +622,24 @@ mod tests {
         assert_eq!(
             reference_index(ReferenceKind::Method, 0x6e, &invoke, 0),
             Some(0xabcd)
+        );
+    }
+
+    #[test]
+    fn batch_string_matcher_preserves_overlaps_duplicates_and_empty_queries() {
+        let strings = ["abc", "zabcab", "other"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let patterns = ["ab", "abc", "ab", "", "no"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let matcher = StringBatchMatcher::new(&patterns).unwrap();
+
+        assert_eq!(
+            matcher.matching_indices(&strings),
+            vec![vec![0, 1], vec![0, 1], vec![0, 1], vec![0, 1, 2], vec![]]
         );
     }
 }

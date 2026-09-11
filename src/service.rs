@@ -15,7 +15,7 @@ use rayon::prelude::*;
 use crate::{
     apk::{ApkSession, DexEntry},
     descriptor_to_java,
-    dex::Query,
+    dex::{Query, ReferenceKind, StringBatchMatcher},
     format_class_name,
     minidex::{MinimalDexStats, extract_minimal_dex},
 };
@@ -76,7 +76,7 @@ pub struct DecompileResult {
     pub timings: DecompileTimings,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReferenceLocation {
     pub dex_name: String,
     pub caller_index: u32,
@@ -105,6 +105,28 @@ pub struct SearchTimings {
 pub struct ReferenceSearchResult {
     pub references: Vec<ReferenceLocation>,
     pub dexes: Vec<DexSearchSummary>,
+    pub timings: SearchTimings,
+}
+
+#[derive(Debug, Clone)]
+pub struct StringReferenceGroup {
+    pub pattern: String,
+    pub references: Vec<ReferenceLocation>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchDexSearchSummary {
+    pub dex_name: String,
+    pub classes: usize,
+    pub methods: usize,
+    /// Number of matching string-table entries for each input pattern.
+    pub matched_targets: Vec<usize>,
+}
+
+#[derive(Debug)]
+pub struct BatchReferenceSearchResult {
+    pub groups: Vec<StringReferenceGroup>,
+    pub dexes: Vec<BatchDexSearchSummary>,
     pub timings: SearchTimings,
 }
 
@@ -300,6 +322,119 @@ impl AscSession {
         let finished = Instant::now();
         Ok(ReferenceSearchResult {
             references,
+            dexes: summaries,
+            timings: SearchTimings {
+                load_ms: (loaded - started).as_secs_f64() * 1000.0,
+                scan_ms: (finished - loaded).as_secs_f64() * 1000.0,
+                total_ms: (finished - started).as_secs_f64() * 1000.0,
+            },
+        })
+    }
+
+    /// Find references for several string patterns in one pass over each DEX
+    /// string table. Results remain grouped in the same order as `patterns`.
+    pub fn find_string_references_batch(
+        &self,
+        patterns: &[String],
+    ) -> Result<BatchReferenceSearchResult> {
+        self.find_string_references_batch_with_observer(patterns, &NoopObserver)
+    }
+
+    pub fn find_string_references_batch_with_observer(
+        &self,
+        patterns: &[String],
+        observer: &dyn OperationObserver,
+    ) -> Result<BatchReferenceSearchResult> {
+        if patterns.is_empty() {
+            bail!("batch string query needs at least one value");
+        }
+        let started = Instant::now();
+        check_cancelled(observer)?;
+        observer.on_progress(&ProgressEvent {
+            stage: OperationStage::Loading,
+            completed: 0,
+            total: self.apk.dex_info().len(),
+            item: None,
+        });
+        let entries = self.apk.load_all_parsed_dexes()?;
+        let loaded = Instant::now();
+        let matcher = StringBatchMatcher::new(patterns)?;
+        let total = entries.len();
+        observer.on_progress(&ProgressEvent {
+            stage: OperationStage::Loading,
+            completed: total,
+            total,
+            item: None,
+        });
+        let completed = AtomicUsize::new(0);
+        type DexBatch = (BatchDexSearchSummary, Vec<Vec<ReferenceLocation>>);
+        let batches: Vec<Result<DexBatch>> = self.apk.install(|| {
+            entries
+                .par_iter()
+                .map(|entry| {
+                    check_cancelled(observer)?;
+                    let dex = &entry.dex;
+                    let matched = dex.matching_string_indices_batch(&matcher);
+                    let mut reference_groups = Vec::with_capacity(matched.len());
+                    for targets in &matched {
+                        let sites =
+                            dex.scan_reference_sites_sorted(ReferenceKind::String, targets)?;
+                        let references = sites
+                            .into_iter()
+                            .map(|site| {
+                                Ok(ReferenceLocation {
+                                    dex_name: entry.name.clone(),
+                                    caller_index: site.caller_index,
+                                    caller_method: dex.try_format_method(site.caller_index)?,
+                                    code_unit_offset: site.code_unit_offset,
+                                    target_index: site.target_index,
+                                    target_symbol: dex.try_format_match(
+                                        ReferenceKind::String,
+                                        site.target_index,
+                                    )?,
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        reference_groups.push(references);
+                    }
+                    observer.on_progress(&ProgressEvent {
+                        stage: OperationStage::Searching,
+                        completed: completed.fetch_add(1, Ordering::Relaxed) + 1,
+                        total,
+                        item: Some(entry.name.clone()),
+                    });
+                    Ok((
+                        BatchDexSearchSummary {
+                            dex_name: entry.name.clone(),
+                            classes: dex.class_count(),
+                            methods: dex.method_count(),
+                            matched_targets: matched.iter().map(Vec::len).collect(),
+                        },
+                        reference_groups,
+                    ))
+                })
+                .collect()
+        });
+
+        let mut groups = patterns
+            .iter()
+            .map(|pattern| StringReferenceGroup {
+                pattern: pattern.clone(),
+                references: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut summaries = Vec::with_capacity(batches.len());
+        for batch in batches {
+            let (summary, reference_groups) = batch?;
+            summaries.push(summary);
+            for (group, mut references) in groups.iter_mut().zip(reference_groups) {
+                group.references.append(&mut references);
+            }
+        }
+        check_cancelled(observer)?;
+        let finished = Instant::now();
+        Ok(BatchReferenceSearchResult {
+            groups,
             dexes: summaries,
             timings: SearchTimings {
                 load_ms: (loaded - started).as_secs_f64() * 1000.0,

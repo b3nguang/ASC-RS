@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use asc_rs::{
     dex::{MemberQuery, Query},
     format_class_name,
-    service::{AscSession, DecompilationMode, decode_manifest},
+    service::{AscSession, DecompilationMode, ReferenceLocation, decode_manifest},
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -105,6 +105,11 @@ struct FindRefsArgs {
 enum FindQuery {
     /// Find references to strings containing this value.
     String { value: String },
+    /// Find references to several string values in one shared scan.
+    Strings {
+        #[arg(required = true, num_args = 1..)]
+        values: Vec<String>,
+    },
     /// Find references to type descriptors containing this value.
     Type { value: String },
     /// Find references to matching methods.
@@ -201,17 +206,64 @@ fn member_query(args: MemberArgs) -> Result<MemberQuery> {
 }
 
 fn findrefs(args: FindRefsArgs) -> Result<()> {
-    let query = match args.query {
+    let FindRefsArgs {
+        common,
+        output,
+        apk_path,
+        query,
+    } = args;
+    let session = AscSession::open(&apk_path, common.threads)?;
+    if let FindQuery::Strings { values } = query {
+        let result = session.find_string_references_batch(&values)?;
+        let lines = result
+            .groups
+            .iter()
+            .flat_map(|group| {
+                reference_lines(&group.references)
+                    .into_iter()
+                    .map(|line| format!("query={:?} | {line}", group.pattern))
+            })
+            .collect::<Vec<_>>();
+        write_reference_lines(&lines, output.as_ref())?;
+
+        if common.debug {
+            for dex in &result.dexes {
+                eprintln!(
+                    "[DEBUG] {} classes={} methods={} matched={:?}",
+                    dex.dex_name, dex.classes, dex.methods, dex.matched_targets
+                );
+            }
+            print_search_timings(result.timings, lines.len());
+        }
+        return Ok(());
+    }
+
+    let query = match query {
         FindQuery::String { value } => Query::String(value),
         FindQuery::Type { value } => Query::Type(value.replace('.', "/")),
         FindQuery::Method(member) => Query::Method(member_query(member)?),
         FindQuery::Field(member) => Query::Field(member_query(member)?),
+        FindQuery::Strings { .. } => unreachable!(),
     };
-    let session = AscSession::open(&args.apk_path, args.common.threads)?;
     let result = session.find_references(&query)?;
+    let lines = reference_lines(&result.references);
+    write_reference_lines(&lines, output.as_ref())?;
 
+    if common.debug {
+        for dex in &result.dexes {
+            eprintln!(
+                "[DEBUG] {} classes={} methods={} matched={}",
+                dex.dex_name, dex.classes, dex.methods, dex.matched_targets
+            );
+        }
+        print_search_timings(result.timings, lines.len());
+    }
+    Ok(())
+}
+
+fn reference_lines(references: &[ReferenceLocation]) -> Vec<String> {
     let mut grouped = BTreeMap::<(String, u32, String), BTreeSet<String>>::new();
-    for reference in &result.references {
+    for reference in references {
         grouped
             .entry((
                 reference.dex_name.clone(),
@@ -221,7 +273,7 @@ fn findrefs(args: FindRefsArgs) -> Result<()> {
             .or_default()
             .insert(reference.target_symbol.clone());
     }
-    let lines = grouped
+    grouped
         .into_iter()
         .map(|((dex_name, _, caller), matches)| {
             format!(
@@ -229,27 +281,23 @@ fn findrefs(args: FindRefsArgs) -> Result<()> {
                 matches.into_iter().collect::<Vec<_>>().join("; ")
             )
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn write_reference_lines(lines: &[String], output: Option<&PathBuf>) -> Result<()> {
     let text = if lines.is_empty() {
         String::new()
     } else {
         format!("{}\n", lines.join("\n"))
     };
-    write_and_print(&text, args.output.as_ref())?;
+    write_and_print(&text, output)
+}
 
-    if args.common.debug {
-        for dex in &result.dexes {
-            eprintln!(
-                "[DEBUG] {} classes={} methods={} matched={}",
-                dex.dex_name, dex.classes, dex.methods, dex.matched_targets
-            );
-        }
-        eprintln!("[DEBUG] DEX load/parse: {:.3} ms", result.timings.load_ms);
-        eprintln!("[DEBUG] DEX scan: {:.3} ms", result.timings.scan_ms);
-        eprintln!("[DEBUG] Total: {:.3} ms", result.timings.total_ms);
-        eprintln!("[DEBUG] Results: {}", lines.len());
-    }
-    Ok(())
+fn print_search_timings(timings: asc_rs::service::SearchTimings, results: usize) {
+    eprintln!("[DEBUG] DEX load/parse: {:.3} ms", timings.load_ms);
+    eprintln!("[DEBUG] DEX scan: {:.3} ms", timings.scan_ms);
+    eprintln!("[DEBUG] Total: {:.3} ms", timings.total_ms);
+    eprintln!("[DEBUG] Results: {results}");
 }
 
 fn write_and_print(text: &str, output: Option<&PathBuf>) -> Result<()> {

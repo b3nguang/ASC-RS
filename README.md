@@ -5,10 +5,12 @@ ASC-RS is a Rust rewrite of the command-line core of
 directly from an APK, parses DEX metadata without Python, locates classes, and
 scans bytecode references to strings, types, methods, and fields.
 
-Java source rendering is provided by Androguard's pure-Rust `dex-decompiler`,
+Java source rendering defaults to Androguard's pure-Rust `dex-decompiler`,
 which builds on its Rust `dex-parser` and `dex-bytecode` projects. Binary
-Android manifests are decoded by Androguard's Rust `axml-parser`. There is no
-Python, JVM, JADX, or other external runtime dependency.
+Android manifests are decoded by Androguard's Rust `axml-parser`. This default
+path has no Python, JVM, JADX, or other external runtime dependency. An optional
+JADX CLI backend is available when higher-level Java reconstruction is more
+important than startup latency.
 
 `getclass` follows ASC's on-demand pipeline rather than decompiling the whole
 DEX:
@@ -23,7 +25,7 @@ DEX:
    instruction and metadata operands.
 5. Build and validate a one-class DEX in memory, including section layout,
    SHA-1 signature, and Adler-32 checksum.
-6. Pass that small DEX to the pure-Rust decompiler.
+6. Pass that small DEX to the selected built-in or JADX decompiler.
 
 The parser primitives used by reference search and minimal-DEX extraction live
 in one shared format layer. A reusable `AscSession` owns APK metadata, a bounded
@@ -46,6 +48,8 @@ The executable is `target/release/asc-rs.exe` on Windows.
 
 ```powershell
 asc-rs getclass app.apk com.example.Main -o Main.java
+asc-rs getclass --engine jadx app.apk com.example.Main -o Main.java
+asc-rs getclass --engine jadx --jadx-path C:\tools\jadx\bin\jadx.bat app.apk com.example.Main
 asc-rs findrefs app.apk string Authorization
 asc-rs findrefs app.apk strings Authorization token api.example.com
 asc-rs findrefs app.apk type com.example.Main
@@ -56,9 +60,12 @@ asc-rs manifest app.apk -o AndroidManifest.xml
 ```
 
 Use `--debug` for per-DEX counts and timings, and `--threads N` to choose the
-number of DEX inflation and search workers. `getclass` defaults to the fast `simple`
-decompilation strategy; use `-m restructure` for more structured output or
-`-m fallback` for a linear representation of difficult bytecode.
+number of DEX inflation and search workers. `getclass` defaults to the in-process
+pure-Rust `builtin` engine and its fast `simple` strategy. Use `--engine jadx`
+for the external JADX CLI, which is usually slower to start but often produces
+more readable Java. ASC-RS searches for JADX on `PATH`; `--jadx-path PATH` selects
+an explicit executable or launcher. JADX defaults to `restructure`; both engines
+accept explicit `-m restructure`, `-m simple`, and `-m fallback` overrides.
 
 The `strings` form accepts one or more patterns and scans each DEX string table
 once with a shared multi-pattern matcher. Its output stays grouped by query;
@@ -76,13 +83,23 @@ Frontends can keep one session open and receive structured results:
 ```rust
 use asc_rs::{
     dex::Query,
-    service::{AscSession, DecompilationMode},
+    service::{
+        AscSession, DecompilationEngine, DecompilationMode, DecompileOptions,
+    },
 };
 
 let session = AscSession::open("app.apk", 8)?;
 let class = session.decompile_class(
     "com.example.Main",
     DecompilationMode::Simple,
+)?;
+let jadx_class = session.decompile_class_with_options(
+    "com.example.Main",
+    &DecompileOptions {
+        engine: DecompilationEngine::Jadx,
+        mode: DecompilationMode::Restructure,
+        jadx_executable: None,
+    },
 )?;
 let references = session.find_references(
     &Query::String("Authorization".to_owned()),

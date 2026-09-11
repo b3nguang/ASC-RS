@@ -1,7 +1,9 @@
 //! Reusable high-level operations for CLI and GUI frontends.
 
 use std::{
-    path::Path,
+    fs,
+    path::{Path, PathBuf},
+    process::{Command, Output},
     sync::atomic::{AtomicUsize, Ordering},
     time::Instant,
 };
@@ -72,8 +74,46 @@ pub struct DecompileResult {
     pub source: String,
     pub descriptor: String,
     pub dex_name: String,
+    pub engine: DecompilationEngine,
     pub minimal_stats: MinimalDexStats,
     pub timings: DecompileTimings,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DecompilationEngine {
+    /// The in-process, pure-Rust `dex-decompiler` backend.
+    #[default]
+    Builtin,
+    /// The external JADX command-line backend.
+    Jadx,
+}
+
+impl DecompilationEngine {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Builtin => "built-in Rust",
+            Self::Jadx => "JADX",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DecompileOptions {
+    pub engine: DecompilationEngine,
+    pub mode: DecompilationMode,
+    /// Optional JADX executable or launcher path. When omitted, ASC-RS searches
+    /// PATH for the platform's usual `jadx` launchers.
+    pub jadx_executable: Option<PathBuf>,
+}
+
+impl Default for DecompileOptions {
+    fn default() -> Self {
+        Self {
+            engine: DecompilationEngine::Builtin,
+            mode: DecompilationMode::Simple,
+            jadx_executable: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,13 +212,43 @@ impl AscSession {
         class_name: &str,
         mode: DecompilationMode,
     ) -> Result<DecompileResult> {
-        self.decompile_class_with_observer(class_name, mode, &NoopObserver)
+        self.decompile_class_with_options(
+            class_name,
+            &DecompileOptions {
+                mode,
+                ..DecompileOptions::default()
+            },
+        )
     }
 
     pub fn decompile_class_with_observer(
         &self,
         class_name: &str,
         mode: DecompilationMode,
+        observer: &dyn OperationObserver,
+    ) -> Result<DecompileResult> {
+        self.decompile_class_with_options_and_observer(
+            class_name,
+            &DecompileOptions {
+                mode,
+                ..DecompileOptions::default()
+            },
+            observer,
+        )
+    }
+
+    pub fn decompile_class_with_options(
+        &self,
+        class_name: &str,
+        options: &DecompileOptions,
+    ) -> Result<DecompileResult> {
+        self.decompile_class_with_options_and_observer(class_name, options, &NoopObserver)
+    }
+
+    pub fn decompile_class_with_options_and_observer(
+        &self,
+        class_name: &str,
+        options: &DecompileOptions,
         observer: &dyn OperationObserver,
     ) -> Result<DecompileResult> {
         let started = Instant::now();
@@ -221,8 +291,9 @@ impl AscSession {
             total: 1,
             item: Some(descriptor.clone()),
         });
-        let source = decompile_minimal(&entry, &minimal.bytes, &descriptor, mode)?;
+        let source = decompile_minimal(&entry, &minimal.bytes, &descriptor, options)?;
         let finished = Instant::now();
+        check_cancelled(observer)?;
         observer.on_progress(&ProgressEvent {
             stage: OperationStage::Decompiling,
             completed: 1,
@@ -233,6 +304,7 @@ impl AscSession {
             source,
             descriptor,
             dex_name: entry.name,
+            engine: options.engine,
             minimal_stats: minimal.stats,
             timings: DecompileTimings {
                 locate_ms: (located - started).as_secs_f64() * 1000.0,
@@ -483,6 +555,25 @@ fn decompile_minimal(
     entry: &DexEntry,
     bytes: &[u8],
     descriptor: &str,
+    options: &DecompileOptions,
+) -> Result<String> {
+    match options.engine {
+        DecompilationEngine::Builtin => {
+            decompile_minimal_builtin(entry, bytes, descriptor, options.mode)
+        }
+        DecompilationEngine::Jadx => decompile_minimal_jadx(
+            bytes,
+            descriptor,
+            options.mode,
+            options.jadx_executable.as_deref(),
+        ),
+    }
+}
+
+fn decompile_minimal_builtin(
+    entry: &DexEntry,
+    bytes: &[u8],
+    descriptor: &str,
     mode: DecompilationMode,
 ) -> Result<String> {
     let parsed = parse_dex(bytes)
@@ -545,6 +636,100 @@ fn decompile_minimal(
         return Ok(repair_double_encoded_utf8(source));
     }
     bail!("class {descriptor} was located but dex-decompiler could not resolve it")
+}
+
+fn decompile_minimal_jadx(
+    bytes: &[u8],
+    descriptor: &str,
+    mode: DecompilationMode,
+    executable: Option<&Path>,
+) -> Result<String> {
+    let workspace = tempfile::tempdir().context("failed to create temporary JADX workspace")?;
+    let dex_path = workspace.path().join("class.dex");
+    let source_path = workspace.path().join("class.java");
+    fs::write(&dex_path, bytes).context("failed to write temporary minimal DEX for JADX")?;
+
+    let class_name = descriptor_to_java(descriptor);
+    let arguments = [
+        "--single-class".as_ref(),
+        class_name.as_ref(),
+        "--single-class-output".as_ref(),
+        source_path.as_os_str(),
+        "--decompilation-mode".as_ref(),
+        decompilation_mode_name(mode).as_ref(),
+        "--threads-count".as_ref(),
+        "1".as_ref(),
+        "--no-res".as_ref(),
+        "--quiet".as_ref(),
+        dex_path.as_os_str(),
+    ];
+    let output = run_jadx(executable, &arguments).with_context(|| {
+        let requested = executable
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "jadx (from PATH)".to_owned());
+        format!("failed to launch JADX via {requested}; install JADX or pass --jadx-path <PATH>")
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let diagnostic = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        bail!(
+            "JADX exited with {} while decompiling {class_name}: {}",
+            output.status,
+            tail(diagnostic, 8 * 1024)
+        );
+    }
+    let source = fs::read_to_string(&source_path)
+        .with_context(|| format!("JADX did not produce source for {class_name}"))?;
+    Ok(source.trim_start_matches('\u{feff}').to_owned())
+}
+
+fn decompilation_mode_name(mode: DecompilationMode) -> &'static str {
+    match mode {
+        DecompilationMode::Restructure => "restructure",
+        DecompilationMode::Simple => "simple",
+        DecompilationMode::Fallback => "fallback",
+    }
+}
+
+fn run_jadx(executable: Option<&Path>, arguments: &[&std::ffi::OsStr]) -> std::io::Result<Output> {
+    if let Some(executable) = executable {
+        return Command::new(executable).args(arguments).output();
+    }
+
+    #[cfg(windows)]
+    let candidates = ["jadx.exe", "jadx.cmd", "jadx.bat", "jadx"];
+    #[cfg(not(windows))]
+    let candidates = ["jadx"];
+
+    let mut last_error = None;
+    for candidate in candidates {
+        match Command::new(candidate).args(arguments).output() {
+            Ok(output) => return Ok(output),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "JADX executable not found")
+    }))
+}
+
+fn tail(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut start = text.len() - max_bytes;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
 }
 
 fn repair_double_encoded_utf8(mut text: String) -> String {

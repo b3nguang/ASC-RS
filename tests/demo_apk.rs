@@ -4,7 +4,7 @@ use asc_rs::{
     apk::ApkSession,
     dex::{Dex, Query, ReferenceKind, class_descriptors},
     minidex::{extract_minimal_dex, validate_minimal_dex},
-    service::AscSession,
+    service::{AscSession, DecompilationEngine, DecompileOptions},
 };
 use dex_decompiler::{DecompilationMode, Decompiler, DecompilerOptions, parse_dex};
 use sha1::{Digest, Sha1};
@@ -213,4 +213,20 @@ fn external_demo_apk_class_and_string_reference() {
         )
         .expect("decompile through service API");
     assert!(decompiled.source.contains("请先注册id"));
+
+    if env::var_os("ASC_TEST_JADX").is_some() {
+        let jadx = asc
+            .decompile_class_with_options(
+                "com.zj.wuaipojie.ui.MainActivity",
+                &DecompileOptions {
+                    engine: DecompilationEngine::Jadx,
+                    mode: DecompilationMode::Restructure,
+                    jadx_executable: None,
+                },
+            )
+            .expect("decompile through JADX backend");
+        assert_eq!(jadx.engine, DecompilationEngine::Jadx);
+        assert!(jadx.source.contains("class MainActivity"));
+        assert!(jadx.source.contains("请先注册id"));
+    }
 }

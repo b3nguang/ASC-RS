@@ -8,7 +8,10 @@ use anyhow::{Context, Result, bail};
 use asc_rs::{
     dex::{MemberQuery, Query},
     format_class_name,
-    service::{AscSession, DecompilationMode, ReferenceLocation, decode_manifest},
+    service::{
+        AscSession, DecompilationEngine, DecompilationMode, DecompileOptions, ReferenceLocation,
+        decode_manifest,
+    },
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -62,13 +65,34 @@ struct GetClassArgs {
     /// Also write decompiled source to this path.
     #[arg(short, long)]
     output: Option<PathBuf>,
-    /// Pure-Rust decompilation strategy.
-    #[arg(short = 'm', long, value_enum, default_value_t = ModeArg::Simple)]
-    decompilation_mode: ModeArg,
+    /// Decompiler backend.
+    #[arg(long, value_enum, default_value_t = EngineArg::Builtin)]
+    engine: EngineArg,
+    /// Explicit JADX executable or launcher path (only with --engine jadx).
+    #[arg(long, value_name = "PATH")]
+    jadx_path: Option<PathBuf>,
+    /// Backend strategy (default: simple for built-in, restructure for JADX).
+    #[arg(short = 'm', long, value_enum)]
+    decompilation_mode: Option<ModeArg>,
     /// Input APK path.
     apk_path: PathBuf,
     /// Dalvik descriptor or Java class name.
     dalvik_class: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum EngineArg {
+    Builtin,
+    Jadx,
+}
+
+impl From<EngineArg> for DecompilationEngine {
+    fn from(value: EngineArg) -> Self {
+        match value {
+            EngineArg::Builtin => Self::Builtin,
+            EngineArg::Jadx => Self::Jadx,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -152,8 +176,20 @@ fn manifest(args: ManifestArgs) -> Result<()> {
 }
 
 fn getclass(args: GetClassArgs) -> Result<()> {
+    if args.engine == EngineArg::Builtin && args.jadx_path.is_some() {
+        bail!("--jadx-path requires --engine jadx");
+    }
     let session = AscSession::open(&args.apk_path, args.common.threads)?;
-    let result = session.decompile_class(&args.dalvik_class, args.decompilation_mode.into())?;
+    let mode = args.decompilation_mode.unwrap_or(match args.engine {
+        EngineArg::Builtin => ModeArg::Simple,
+        EngineArg::Jadx => ModeArg::Restructure,
+    });
+    let options = DecompileOptions {
+        engine: args.engine.into(),
+        mode: mode.into(),
+        jadx_executable: args.jadx_path,
+    };
+    let result = session.decompile_class_with_options(&args.dalvik_class, &options)?;
     write_and_print(&result.source, args.output.as_ref())?;
 
     if args.common.debug {
@@ -178,10 +214,8 @@ fn getclass(args: GetClassArgs) -> Result<()> {
             "[DEBUG] Extract/rebuild: {:.3} ms",
             result.timings.extract_ms
         );
-        eprintln!(
-            "[DEBUG] Rust decompile: {:.3} ms",
-            result.timings.decompile_ms
-        );
+        eprintln!("[DEBUG] Engine: {}", result.engine.display_name());
+        eprintln!("[DEBUG] Decompile: {:.3} ms", result.timings.decompile_ms);
         eprintln!("[DEBUG] Total: {:.3} ms", result.timings.total_ms);
     }
     Ok(())

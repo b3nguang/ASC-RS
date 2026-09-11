@@ -65,6 +65,10 @@ asc-rs findrefs app.apk method onCreate --class com.example.Main
 asc-rs findrefs app.apk method notify --class openclaw --fuzzy-class
 asc-rs findrefs app.apk field token --class com.example.Main
 asc-rs manifest app.apk -o AndroidManifest.xml
+asc-rs classes --contains MainActivity app.apk
+asc-rs entries --contains assets/ app.apk
+asc-rs entry --offset 1024 --length 64 --encoding hex app.apk assets/data.bin
+asc-rs findrefs --format json app.apk string Authorization
 ```
 
 Use `--debug` for per-DEX counts and timings, and `--threads N` to choose the
@@ -84,12 +88,19 @@ Reference results include complete Dalvik method and field signatures. The
 library's structured results additionally retain the caller and target indexes
 and the exact code-unit offset for navigation.
 
+The `classes` command provides lightweight class discovery across all root DEX
+files. `entries` inventories the APK without extracting it, while `entry` reads
+an exact uncompressed byte range as a hex dump, UTF-8 text, or an output-only
+raw file. Every command supports `--format json` except raw entry output;
+`--debug` diagnostics continue to use stderr.
+
 ## Library API
 
 Frontends can keep one session open and receive structured results:
 
 ```rust
 use asc_rs::{
+    apk::{list_entries, read_entry_range},
     dex::Query,
     service::{
         AscSession, DecompilationEngine, DecompilationMode, DecompileOptions,
@@ -116,6 +127,14 @@ let batch = session.find_string_references_batch(&[
     "Authorization".to_owned(),
     "token".to_owned(),
 ])?;
+let classes = session.apk().list_classes()?;
+let entries = list_entries(std::path::Path::new("app.apk"))?;
+let bytes = read_entry_range(
+    std::path::Path::new("app.apk"),
+    "assets/data.bin",
+    1024,
+    Some(64),
+)?;
 # Ok::<(), anyhow::Error>(())
 ```
 

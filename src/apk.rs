@@ -31,6 +31,20 @@ pub struct DexInfo {
     pub uncompressed_size: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApkEntryInfo {
+    pub name: String,
+    pub compressed_size: u64,
+    pub uncompressed_size: u64,
+    pub is_directory: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApkClassInfo {
+    pub dex_name: String,
+    pub descriptor: String,
+}
+
 #[derive(Debug, Default)]
 struct ClassIndex {
     by_descriptor: HashMap<String, usize>,
@@ -386,6 +400,35 @@ impl ApkSession {
         entries.into_iter().collect()
     }
 
+    /// List every class definition across root `classes*.dex` entries while
+    /// preserving DEX and class-table order.
+    pub fn list_classes(&self) -> Result<Vec<ApkClassInfo>> {
+        let entries = self.load_all_dexes()?;
+        let batches: Vec<Result<Vec<ApkClassInfo>>> = self.pool.install(|| {
+            entries
+                .par_iter()
+                .map(|entry| {
+                    class_descriptors(&entry.data)
+                        .with_context(|| format!("failed to list classes in {}", entry.name))
+                        .map(|descriptors| {
+                            descriptors
+                                .into_iter()
+                                .map(|descriptor| ApkClassInfo {
+                                    dex_name: entry.name.clone(),
+                                    descriptor,
+                                })
+                                .collect()
+                        })
+                })
+                .collect()
+        });
+        let mut classes = Vec::new();
+        for batch in batches {
+            classes.extend(batch?);
+        }
+        Ok(classes)
+    }
+
     pub(crate) fn load_all_parsed_dexes(&self) -> Result<Vec<ParsedDexEntry>> {
         let entries: Vec<Result<ParsedDexEntry>> = self.pool.install(|| {
             (0..self.dexes.len())
@@ -454,7 +497,38 @@ impl ApkSession {
     }
 }
 
+/// List all ZIP entries in deterministic name order without inflating them.
+pub fn list_entries(apk_path: &Path) -> Result<Vec<ApkEntryInfo>> {
+    let file = File::open(apk_path)
+        .with_context(|| format!("failed to open APK {}", apk_path.display()))?;
+    let mut archive = ZipArchive::new(file)
+        .with_context(|| format!("{} is not a readable ZIP/APK", apk_path.display()))?;
+    let mut entries = Vec::with_capacity(archive.len());
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index)?;
+        entries.push(ApkEntryInfo {
+            name: entry.name().to_owned(),
+            compressed_size: entry.compressed_size(),
+            uncompressed_size: entry.size(),
+            is_directory: entry.is_dir(),
+        });
+    }
+    entries.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    Ok(entries)
+}
+
 pub fn read_entry(apk_path: &Path, name: &str) -> Result<Vec<u8>> {
+    read_entry_range(apk_path, name, 0, None)
+}
+
+/// Inflate a bounded byte range from one APK entry. Offset and length are
+/// measured in uncompressed bytes.
+pub fn read_entry_range(
+    apk_path: &Path,
+    name: &str,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<Vec<u8>> {
     let file = File::open(apk_path)
         .with_context(|| format!("failed to open APK {}", apk_path.display()))?;
     let mut archive = ZipArchive::new(file)
@@ -462,11 +536,39 @@ pub fn read_entry(apk_path: &Path, name: &str) -> Result<Vec<u8>> {
     let mut entry = archive
         .by_name(name)
         .with_context(|| format!("APK has no {name} entry"))?;
-    let capacity = usize::try_from(entry.size()).unwrap_or(0);
+    let entry_size = entry.size();
+    ensure!(
+        offset <= entry_size,
+        "entry range starts at {offset}, past the {entry_size}-byte end of {name}"
+    );
+    let available = entry_size - offset;
+    let selected = length.unwrap_or(available);
+    ensure!(
+        selected <= available,
+        "entry range length {selected} exceeds the {available} bytes available at offset {offset} in {name}"
+    );
+
+    let mut remaining = offset;
+    let mut discard = [0u8; 16 * 1024];
+    while remaining > 0 {
+        let chunk = usize::try_from(remaining.min(discard.len() as u64)).unwrap();
+        let read = entry
+            .read(&mut discard[..chunk])
+            .with_context(|| format!("failed to seek to byte {offset} in {name}"))?;
+        ensure!(read > 0, "unexpected end of {name} before byte {offset}");
+        remaining -= read as u64;
+    }
+
+    let capacity = usize::try_from(selected).context("selected APK entry range is too large")?;
     let mut data = Vec::with_capacity(capacity);
     entry
+        .take(selected)
         .read_to_end(&mut data)
-        .with_context(|| format!("failed to inflate {name}"))?;
+        .with_context(|| format!("failed to inflate bytes {offset}.. from {name}"))?;
+    ensure!(
+        data.len() as u64 == selected,
+        "unexpected end of {name} while reading {selected} bytes at offset {offset}"
+    );
     Ok(data)
 }
 
@@ -509,6 +611,10 @@ mod tests {
         let mut dex = vec![0; 0x70];
         dex[..8].copy_from_slice(b"dex\n035\0");
         archive.write_all(&dex).unwrap();
+        archive
+            .start_file("assets/sample.bin", zip::write::FileOptions::default())
+            .unwrap();
+        archive.write_all(b"0123456789").unwrap();
         archive.finish().unwrap();
         TempApk(path)
     }
@@ -519,6 +625,29 @@ mod tests {
         assert!(is_root_dex("classes2.dex"));
         assert!(!is_root_dex("assets/classes.dex"));
         assert!(!is_root_dex("classesx.dex"));
+    }
+
+    #[test]
+    fn lists_and_reads_bounded_apk_entries() {
+        let apk = empty_dex_apk();
+        assert_eq!(
+            list_entries(&apk.0)
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>(),
+            vec!["assets/sample.bin", "classes.dex"]
+        );
+        assert_eq!(
+            read_entry_range(&apk.0, "assets/sample.bin", 3, Some(4)).unwrap(),
+            b"3456"
+        );
+        assert!(
+            read_entry_range(&apk.0, "assets/sample.bin", 8, Some(3))
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds")
+        );
     }
 
     #[test]

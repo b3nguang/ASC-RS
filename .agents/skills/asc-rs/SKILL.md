@@ -1,6 +1,6 @@
 ---
 name: asc-rs
-description: Analyze user-provided Android APK files with ASC-RS by decompiling a known class, locating string/type/method/field bytecode references, or decoding AndroidManifest.xml. Use for focused local APK inspection; do not use for whole-app bulk decompilation, resource extraction, APK modification, signing, or installation.
+description: Analyze user-provided Android APK files with ASC-RS by listing classes or archive entries, reading bounded entry ranges, decompiling a known class, locating bytecode references, or decoding AndroidManifest.xml. Use for focused local APK inspection; do not use for whole-app bulk decompilation or extraction, APK modification, signing, or installation.
 ---
 
 # ASC-RS APK analysis
@@ -18,6 +18,11 @@ retain a warm session through its Rust library API.
   string table is traversed once and results remain grouped by query.
 - For package, component, permission, SDK, or application metadata, decode the
   manifest with `manifest` and inspect the XML.
+- To discover a class name without scanning references, use `classes` with a
+  narrow `--contains` filter.
+- To inspect packaged files, use `entries` first, then `entry` for the exact
+  file and smallest useful uncompressed byte range. Prefer UTF-8 for known text
+  and hex for unknown data; write raw bytes only when an output artifact helps.
 - If the user has a keyword but not a class name, find references first, take
   the caller class from the full Dalvik signature, then decompile that class.
 - If the user requests broad browsing of all application code or APK changes,
@@ -47,6 +52,9 @@ Confirm the APK path and requested class/query from available context, then run
 the narrowest command that answers the request. Quote paths and query values.
 Write an output file only when the user requests one or the result needs to be
 handed off as an artifact.
+
+Use `--format json` when the result will feed another command or program. Keep
+the default text form for direct inspection and user-facing excerpts.
 
 Treat decompiled Java as an analysis aid, not guaranteed buildable source.
 Clearly distinguish tool output from conclusions inferred from it. Report the

@@ -21,7 +21,7 @@ paths or values that contain spaces or shell metacharacters. Put `getclass` and
 
 ```text
 <asc> getclass [--debug] [--threads N] [-o FILE] \
-  [--engine builtin|jadx] [--jadx-path PATH] \
+  [--format text|json] [--engine builtin|jadx] [--jadx-path PATH] \
   [-m restructure|simple|fallback] APK CLASS
 ```
 
@@ -45,7 +45,8 @@ Examples:
 
 ## Find bytecode references
 
-Parent options are `--debug`, `--threads N`, and `-o FILE`:
+Parent options are `--debug`, `--threads N`, `--format text|json`, and
+`-o FILE`:
 
 ```text
 <asc> findrefs [--debug] [--threads N] [-o FILE] APK string VALUE
@@ -83,11 +84,50 @@ Examples:
 ## Decode the manifest
 
 ```text
-<asc> manifest [--compact] [-o FILE] APK
+<asc> manifest [--compact] [--format text|json] [-o FILE] APK
 ```
 
 The default is pretty-printed XML. Use `--compact` only when compact output is
 specifically useful.
+
+## Discover classes
+
+```text
+<asc> classes [--threads N] [--debug] [--format text|json] \
+  [--contains VALUE] [-o FILE] APK
+```
+
+This lists definitions from every root `classes*.dex` in DEX/class-table order.
+`--contains` is a descriptor substring match; dots in Java package names are
+normalized to slashes. Text output contains the DEX name and descriptor. JSON
+also includes the Java class name.
+
+## Inspect APK entries
+
+List archive entries without inflating them:
+
+```text
+<asc> entries [--contains VALUE] [--format text|json] [-o FILE] APK
+```
+
+Read a bounded range, using offsets and lengths in uncompressed bytes:
+
+```text
+<asc> entry [--offset N] [--length N] [--encoding utf8|hex|raw] \
+  [--format text|json] [-o FILE] APK ENTRY
+```
+
+Use `entries` to resolve the exact case-sensitive entry name. `hex` is the
+default and includes absolute entry offsets. `utf8` rejects invalid text rather
+than replacing bytes. `raw` requires `-o FILE` and cannot be combined with JSON.
+Ranges that extend past the entry fail instead of silently truncating.
+
+## Structured output
+
+`getclass`, `findrefs`, `manifest`, `classes`, `entries`, and non-raw `entry`
+accept `--format json`. The JSON form preserves reference indexes, bytecode
+offsets, DEX summaries, timings, and class/minimal-DEX metadata where relevant.
+Diagnostics from `--debug` remain on stderr so stdout stays machine-readable.
 
 ## Failures and follow-up
 

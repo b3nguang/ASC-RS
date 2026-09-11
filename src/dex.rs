@@ -281,6 +281,10 @@ impl Dex {
     }
 
     pub fn matching_indices(&self, query: &Query) -> HashSet<u32> {
+        self.matching_indices_sorted(query).into_iter().collect()
+    }
+
+    pub(crate) fn matching_indices_sorted(&self, query: &Query) -> Vec<u32> {
         match query {
             Query::String(pattern) => self
                 .strings

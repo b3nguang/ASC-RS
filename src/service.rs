@@ -349,8 +349,8 @@ impl AscSession {
                     .map(|entry| {
                         check_cancelled(observer)?;
                         let dex = &entry.dex;
-                        let matched = dex.matching_indices(query);
-                        let sites = dex.scan_reference_sites(query.kind(), &matched)?;
+                        let matched = dex.matching_indices_sorted(query);
+                        let sites = dex.scan_reference_sites_sorted(query.kind(), &matched)?;
                         let references = sites
                             .into_iter()
                             .map(|site| {

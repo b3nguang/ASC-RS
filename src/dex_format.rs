@@ -138,6 +138,10 @@ pub(crate) fn read_uleb(data: &[u8], cursor: &mut usize) -> Result<u32> {
 }
 
 pub(crate) fn decode_mutf8(data: &[u8]) -> String {
+    if data.is_ascii() {
+        return String::from_utf8_lossy(data).into_owned();
+    }
+
     let mut units = Vec::with_capacity(data.len());
     let mut cursor = 0;
     while cursor < data.len() {

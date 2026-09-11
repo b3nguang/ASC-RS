@@ -15,8 +15,9 @@ important than startup latency.
 `getclass` follows ASC's on-demand pipeline rather than decompiling the whole
 DEX:
 
-1. Read root DEX metadata once, then index class tables only until the requested
-   class is found.
+1. Read root DEX metadata from the mapped ZIP central directory, then probe
+   compressed-size-ordered DEX files with a type-table binary search until the
+   requested class is found.
 2. Walk only that class's instructions and collect string/type/field/method
    dependencies.
 3. Preserve its interfaces, annotations, static values, debug metadata, and
@@ -28,13 +29,16 @@ DEX:
 6. Pass that small DEX to the selected built-in or JADX decompiler.
 
 The parser primitives used by reference search and minimal-DEX extraction live
-in one shared format layer. A reusable `AscSession` owns APK metadata, a bounded
-LRU DEX cache, the lazy class index, and its worker pool. Cached entries retain
-parsed metadata, method descriptors, and per-reference-kind bytecode indexes;
-repeated GUI/service queries therefore avoid reinflating, reparsing, and walking
-the same instructions. Concurrent requests for the same entry share one load.
-The bytecode walker reads little-endian code units directly from the DEX buffer
-instead of allocating a temporary instruction vector for every method.
+in one shared format layer. A reusable `AscSession` owns mapped APK metadata, a
+bounded LRU DEX cache, successful class locations, and its worker pool. Cached
+entries retain parsed metadata, method descriptors, and per-reference-kind
+bytecode indexes; repeated GUI/service queries therefore avoid reinflating,
+reparsing, and walking the same instructions. Concurrent requests for the same
+entry share one load. The bytecode walker reads little-endian code units directly
+from the DEX buffer instead of allocating a temporary instruction vector for
+every method.
+Physical DEX 041 containers are exposed and searched as separate logical DEX
+files while their absolute offsets continue to address one shared buffer.
 
 ## Build
 

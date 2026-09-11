@@ -39,25 +39,29 @@ pub(crate) struct MethodId {
 
 impl DexHeader {
     pub fn parse(data: &[u8]) -> Result<Self> {
-        if data.len() < 0x70 {
+        Self::parse_at(data, 0)
+    }
+
+    pub fn parse_at(data: &[u8], header_offset: usize) -> Result<Self> {
+        if data.len().saturating_sub(header_offset) < 0x70 {
             bail!("DEX is shorter than its header");
         }
-        if &data[..4] != b"dex\n" || data[7] != 0 {
+        if bytes_at(data, header_offset, 4)? != b"dex\n" || data[header_offset + 7] != 0 {
             bail!("invalid DEX magic");
         }
         let header = Self {
-            string_ids_size: u32_at(data, 0x38)?,
-            string_ids_off: u32_at(data, 0x3c)?,
-            type_ids_size: u32_at(data, 0x40)?,
-            type_ids_off: u32_at(data, 0x44)?,
-            proto_ids_size: u32_at(data, 0x48)?,
-            proto_ids_off: u32_at(data, 0x4c)?,
-            field_ids_size: u32_at(data, 0x50)?,
-            field_ids_off: u32_at(data, 0x54)?,
-            method_ids_size: u32_at(data, 0x58)?,
-            method_ids_off: u32_at(data, 0x5c)?,
-            class_defs_size: u32_at(data, 0x60)?,
-            class_defs_off: u32_at(data, 0x64)?,
+            string_ids_size: u32_at(data, header_offset + 0x38)?,
+            string_ids_off: u32_at(data, header_offset + 0x3c)?,
+            type_ids_size: u32_at(data, header_offset + 0x40)?,
+            type_ids_off: u32_at(data, header_offset + 0x44)?,
+            proto_ids_size: u32_at(data, header_offset + 0x48)?,
+            proto_ids_off: u32_at(data, header_offset + 0x4c)?,
+            field_ids_size: u32_at(data, header_offset + 0x50)?,
+            field_ids_off: u32_at(data, header_offset + 0x54)?,
+            method_ids_size: u32_at(data, header_offset + 0x58)?,
+            method_ids_off: u32_at(data, header_offset + 0x5c)?,
+            class_defs_size: u32_at(data, header_offset + 0x60)?,
+            class_defs_off: u32_at(data, header_offset + 0x64)?,
         };
         for (name, size, offset, item_size) in [
             (

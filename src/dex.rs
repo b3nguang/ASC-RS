@@ -163,7 +163,11 @@ impl Dex {
     }
 
     pub fn parse_shared(data: Arc<[u8]>) -> Result<Self> {
-        let header = Header::parse(&data)?;
+        Self::parse_shared_at(data, 0)
+    }
+
+    pub(crate) fn parse_shared_at(data: Arc<[u8]>, header_offset: usize) -> Result<Self> {
+        let header = Header::parse_at(&data, header_offset)?;
         let strings = read_strings(&data, &header)?;
         let types = read_types(&data, &header)?;
         let protos = read_proto_ids(&data, &header)?;
@@ -541,7 +545,11 @@ pub struct ReferenceSite {
 /// Read only the tables required to index class definitions. This avoids
 /// walking every method and code item when locating one class in a multidex APK.
 pub fn class_descriptors(data: &[u8]) -> Result<Vec<String>> {
-    let header = Header::parse(data)?;
+    class_descriptors_at(data, 0)
+}
+
+pub(crate) fn class_descriptors_at(data: &[u8], header_offset: usize) -> Result<Vec<String>> {
+    let header = Header::parse_at(data, header_offset)?;
     let types = read_types(data, &header)?;
     let mut result = Vec::with_capacity(header.class_defs_size as usize);
     for index in 0..header.class_defs_size as usize {
@@ -552,6 +560,63 @@ pub fn class_descriptors(data: &[u8]) -> Result<Vec<String>> {
         result.push(read_string(data, &header, string_idx as usize)?);
     }
     Ok(result)
+}
+
+/// Probe the sorted type table and then the class-def table without building a
+/// full class index. This is the same on-demand path used by original ASC.
+pub(crate) fn dex_defines_class_at(
+    data: &[u8],
+    header_offset: usize,
+    target: &str,
+) -> Result<bool> {
+    let header = Header::parse_at(data, header_offset)?;
+    if header.string_ids_size == 0 || header.type_ids_size == 0 {
+        return Ok(false);
+    }
+
+    let target = target.as_bytes();
+    let mut left = 0usize;
+    let mut right = header.type_ids_size as usize;
+    let mut target_type = None;
+    while left < right {
+        let middle = left + (right - left) / 2;
+        let string_idx = u32_at(data, header.type_ids_off as usize + middle * 4)?;
+        ensure!(
+            string_idx < header.string_ids_size,
+            "type #{middle} has invalid string index"
+        );
+        let mut string_offset = u32_at(
+            data,
+            header.string_ids_off as usize + string_idx as usize * 4,
+        )? as usize;
+        let _utf16_size = read_uleb(data, &mut string_offset)?;
+        let tail = data
+            .get(string_offset..)
+            .with_context(|| format!("string #{string_idx} data offset is out of bounds"))?;
+        let end = tail
+            .iter()
+            .position(|&byte| byte == 0)
+            .map(|length| string_offset + length)
+            .with_context(|| format!("unterminated DEX string #{string_idx}"))?;
+        match data[string_offset..end].cmp(target) {
+            std::cmp::Ordering::Less => left = middle + 1,
+            std::cmp::Ordering::Greater => right = middle,
+            std::cmp::Ordering::Equal => {
+                target_type = Some(middle as u32);
+                break;
+            }
+        }
+    }
+    let Some(target_type) = target_type else {
+        return Ok(false);
+    };
+
+    for index in 0..header.class_defs_size as usize {
+        if u32_at(data, header.class_defs_off as usize + index * 32)? == target_type {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn code_unit(bytes: &[u8], pc: usize) -> Result<u16> {

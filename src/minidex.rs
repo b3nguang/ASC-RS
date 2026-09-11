@@ -310,7 +310,11 @@ fn write_mutf8(value: &str, out: &mut Vec<u8>) {
 
 impl<'a> DexView<'a> {
     fn parse(data: &'a [u8]) -> Result<Self> {
-        let header = Header::parse(data)?;
+        Self::parse_at(data, 0)
+    }
+
+    fn parse_at(data: &'a [u8], header_offset: usize) -> Result<Self> {
+        let header = Header::parse_at(data, header_offset)?;
         let strings = read_strings(data, &header)?;
         let type_descriptor_indices = read_types(data, &header)?;
         let protos = read_proto_ids(data, &header)?;
@@ -2289,7 +2293,15 @@ pub fn validate_minimal_dex(data: &[u8]) -> Result<()> {
 
 /// Extract one class and its direct DEX dependencies into a dense, standalone DEX.
 pub fn extract_minimal_dex(data: &[u8], descriptor: &str) -> Result<MinimalDex> {
-    let dex = DexView::parse(data)?;
+    extract_minimal_dex_at(data, 0, descriptor)
+}
+
+pub(crate) fn extract_minimal_dex_at(
+    data: &[u8],
+    header_offset: usize,
+    descriptor: &str,
+) -> Result<MinimalDex> {
+    let dex = DexView::parse_at(data, header_offset)?;
     let class = dex
         .find_class(descriptor)?
         .with_context(|| format!("class {descriptor} not found in DEX"))?;

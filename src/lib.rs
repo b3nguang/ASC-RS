@@ -3,6 +3,7 @@ pub mod dex;
 pub mod minidex;
 pub mod service;
 
+mod dex_container;
 mod dex_format;
 
 use anyhow::{Result, bail};

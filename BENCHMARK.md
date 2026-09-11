@@ -23,16 +23,16 @@
 
 | 用例 | 原版中位数 | ASC-RS 中位数 | 较快实现 | 7 次范围（原版 / Rust） |
 |---|---:|---:|---:|---:|
-| `getclass MainActivity` | 198.040 ms | 142.990 ms | Rust 1.38× | 194.685–203.533 / 138.141–155.939 ms |
-| `findrefs string FIRST_START` | 373.220 ms | 138.790 ms | Rust 2.69× | 363.321–392.755 / 135.167–140.627 ms |
-| `findrefs type SPUtils` | 407.240 ms | 138.490 ms | Rust 2.94× | 397.365–428.722 / 134.239–151.884 ms |
-| `findrefs method saveString` | 436.960 ms | 140.130 ms | Rust 3.12× | 431.506–450.356 / 139.003–149.376 ms |
-| `findrefs field INSTANCE` | 427.310 ms | 140.310 ms | Rust 3.05× | 423.749–447.579 / 137.728–140.716 ms |
+| `getclass MainActivity` | 224.052 ms | 90.635 ms | Rust 2.47× | 222.567–312.581 / 80.799–124.986 ms |
+| `findrefs string FIRST_START` | 448.155 ms | 95.612 ms | Rust 4.69× | 409.216–471.673 / 83.264–104.056 ms |
+| `findrefs type SPUtils` | 514.194 ms | 99.727 ms | Rust 5.16× | 496.024–571.285 / 93.579–117.286 ms |
+| `findrefs method saveString` | 540.797 ms | 97.856 ms | Rust 5.53× | 508.764–596.709 / 91.334–111.772 ms |
+| `findrefs field INSTANCE` | 455.920 ms | 94.558 ms | Rust 4.82× | 448.017–489.600 / 85.561–101.357 ms |
 
 ASC-RS 现已移植原版 `DexManager -> DvmInterpreter/IndexHandler ->
 DexHollower -> DexIndexMapper -> DexBuilder` 链路。带内部计时的单次
-`getclass` 为：APK 定位与按需类索引约 57.2 ms、抽取与重建约 15.6 ms、
-纯 Rust 反编译约 7.4 ms、总计约 80.2 ms；新进程墙钟中位数为 143.0 ms。
+`getclass` 为：APK 定位与按需类探测约 31.2 ms、抽取与重建约 17.1 ms、
+纯 Rust 反编译约 8.1 ms、总计约 56.4 ms；新进程墙钟中位数为 90.6 ms。
 
 原始 `classes.dex` 为 9,054,156 字节。原版最小 DEX 为 6,704 字节，
 Rust 最小 DEX 为 6,580 字节。Rust 输出包含 136 个字符串、58 个类型、
@@ -111,12 +111,107 @@ Aho-Corasick 在一次 DEX 字符串表遍历中同时匹配多个模式，并�
   更接近线性 IR，仍存在 `local0`、省略参数和部分错误类型推断。两边输出
   都不能直接作为可编译 Java 使用。
 
+## WPS Office 大型 multidex 三方测试
+
+为验证前述结论在大型多 DEX APK 上是否仍成立，使用用户提供的 WPS Office
+样本补充测试 ASC-RS、原版 ASC 和独立 JADX CLI。测试时间为 2026-09-11。
+
+### 样本与环境
+
+- APK：`moffice_26.9.0_0x0804_cn00563_multidex_64_0c8b155ab49.apk`
+- SHA-256：`485B1E850C0F4AC85424717570A687082F232E3D30C967319B89277F718FFEF8`
+- APK 大小：189,203,175 字节（180.44 MiB）
+- 根 DEX：27 个，解压后合计 221.33 MiB
+- 类定义：217,837 个
+- 包名：`cn.wps.moffice_eng`
+- 已启用的 launcher alias 指向
+  `cn.wps.moffice.documentmanager.PreStartActivity`；目标类位于
+  `classes25.dex`
+- ASC-RS：基于提交 `7ce2dbd` 的本次优化版，rustc 1.97.1，内置 Rust
+  反编译器
+- 原版 ASC：提交 `47663fd`，Python 3.12.13，Androguard 4.1.4
+- JADX：1.5.5，OpenJDK 11.0.30
+- 机器：Windows 11 Pro 10.0.26200，Intel Core i9-13980HX，32 逻辑处理器，
+  63.6 GiB 内存
+
+每个用例先预热一次，再启动全新进程交替执行 5 次。三者都设置为 8 个工作
+线程，系统文件缓存保持预热，输出被丢弃。表中是墙钟时间中位数与 5 次范围。
+JADX 使用 `--single-class --no-res`，只输出同一个目标类，不把资源解码或全 APK
+源码导出时间混入三方对比。
+
+### 原版策略移植与单类按需反编译
+
+初测暴露出两个瓶颈：ASC-RS 通过 `ZipArchive` 扫描 189 MB APK 的全部 ZIP
+元数据，而且按 DEX 序号顺序完整解压、建立所有类描述符后才继续查找。优化版
+按原版 ASC 的路径改为：
+
+1. APK 只读 `mmap`，直接解析 EOCD、中央目录和本地文件头；
+2. 根 DEX 按压缩后大小排序并行探测，命中后用共享取消标志终止其余解压；
+3. Deflate 直接读取 mmap 中的压缩片段，并以 512 KiB 输出块检查取消；
+4. 每个 DEX 只对有序 type 表二分查找目标描述符，再探测 class_defs，不为
+   单类查询建立完整类名索引。
+
+同一机器上重新交替执行优化版和原版各 5 次，结果如下。JADX 一列沿用同一轮
+测试中未发生代码变化的 1.5.5 数据：
+
+| 目标 | 优化前 ASC-RS | 优化后 ASC-RS | 原版 ASC | JADX single-class |
+|---|---:|---:|---:|---:|
+| `classes.dex` 中的 `cn.wps.sdk.fcsync.Fcsync` | 2,139.114 ms | 229.526 ms（206.997–244.393） | 634.405 ms（620.659–718.599） | 未重复测量 |
+| `classes25.dex` 中的 launcher `PreStartActivity` | 25,928.727 ms | 101.944 ms（87.516–180.617） | 280.343 ms（258.216–281.882） | 38,129.376 ms（37,004.277–40,451.506） |
+
+优化后两个位置的类查询分别比原版快 2.76 倍和 2.75 倍；launcher 查询相对
+优化前缩短约 254 倍。launcher 的一次内部计时为 APK 定位/探测 21.895 ms、
+单类抽取与重建 16.302 ms、内置反编译 0.889 ms、合计 39.085 ms。剩余墙钟
+时间主要是新进程启动和清理，而不再是 ZIP 扫描或无关 DEX 的类索引。
+
+### 全局引用搜索
+
+统一执行以下语义相同的查询：
+
+```text
+findrefs APK type PreStartActivity
+```
+
+| 实现 | 中位数 | 5 次范围 |
+|---|---:|---:|
+| 优化前 ASC-RS | 11,240.794 ms | 10,719.291–12,000.966 ms |
+| 优化后 ASC-RS | 392.576 ms | 378.017–439.852 ms |
+| 原版 ASC | 1,244.885 ms | 1,231.865–1,322.096 ms |
+
+优化版比自身初测缩短约 28.6 倍，比原版快 3.17 倍。一次内部计时为 27 个 DEX
+加载/解析 199.347 ms、引用扫描 25.826 ms、总计 225.173 ms。两边仍都返回
+61 个唯一调用方法；把 ASC-RS 的完整签名归一成原版格式后，集合差异为 0。
+
+另外用 WPS 样本覆盖了其余三类定位器：string `PreStartActivity` 为 29/29、
+method `startActivity` in `android.app.Activity` 为 293/293、目标 launcher 类的
+全部 field 引用为 3/3，三组调用者集合的双向差异均为 0。JADX CLI 没有与
+`findrefs` 等价的无索引命令，因此没有把“全量反编译后文本搜索”冒充成同一
+用例。
+
+物理 DEX 041 容器也按原版策略拆分为独立逻辑 DEX；解析时保留共享物理缓冲区
+和绝对偏移，避免为每个逻辑头复制整个容器。
+
+完整的可复跑命令位于 `scripts/compare-moffice.ps1`。例如：
+
+```powershell
+.\scripts\compare-moffice.ps1 -Runs 5
+```
+
+### 大型 multidex 测试结论
+
+WPS 初测发现的两个数量级瓶颈已经消除。移植原版的 mmap ZIP/Deflate 与并行
+按需探测策略后，ASC-RS 在两个单类位置及全局引用搜索三项均快于当前原版，
+同时保留精确相同的归一化调用者集合。相比为整包建立数据库式全局索引，这条
+路径继续保持按查询付费和会话内缓存的设计。
+
 ## 结论
 
-- 引用搜索：ASC-RS 在本样本上调用方法集合一致，速度约快 2.7–3.1 倍，并且
+- 在前述单 DEX Demo 上，ASC-RS 的引用搜索调用方法集合一致，速度约快
+  4.7–5.5 倍，并且
   Unicode 匹配文本更准确。
-- 单类反编译：ASC-RS 已按原版流程先重建单类最小 DEX，新进程测试快约
-  1.38 倍；原版 DAD 的源码可读性仍更好，Rust 后端则能保留完整中文。
-- ASC-RS 默认引擎全程为 Rust，无 Python、JVM 或 JADX 运行时；本样本的
-  命令行核心在速度和引用搜索结果上均已达到或超过原版。需要更高层 Java
-  重建质量时，也可显式切换到外部 JADX 引擎。
+- 在该单 DEX Demo 上，ASC-RS 单类反编译按原版流程先重建最小 DEX，新进程
+  测试快约 2.47 倍；原版 DAD 的源码可读性仍更好，Rust 后端则能保留完整
+  中文。
+- ASC-RS 默认引擎全程为 Rust，无 Python、JVM 或 JADX 运行时；大型
+  multidex 中原先落后的类定位和全局引用搜索现已分别快于原版约 2.75 倍和
+  3.17 倍。需要更高层 Java 重建质量时，仍可显式切换到外部 JADX 引擎。

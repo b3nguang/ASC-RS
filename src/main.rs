@@ -481,6 +481,14 @@ fn getclass(args: GetClassArgs) -> Result<()> {
         eprintln!("[DEBUG] Decompile: {:.3} ms", result.timings.decompile_ms);
         eprintln!("[DEBUG] Total: {:.3} ms", result.timings.total_ms);
     }
+    let cleanup_started = Instant::now();
+    drop(session);
+    if args.common.debug {
+        eprintln!(
+            "[DEBUG] Session cleanup: {:.3} ms",
+            cleanup_started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     Ok(())
 }
 

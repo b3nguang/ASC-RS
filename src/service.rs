@@ -19,7 +19,7 @@ use crate::{
     descriptor_to_java,
     dex::{Query, ReferenceKind, StringBatchMatcher},
     format_class_name,
-    minidex::{MinimalDexStats, extract_minimal_dex},
+    minidex::{MinimalDexStats, extract_minimal_dex_at},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,7 +281,7 @@ impl AscSession {
             total: 1,
             item: Some(entry.name.clone()),
         });
-        let minimal = extract_minimal_dex(&entry.data, &descriptor)
+        let minimal = extract_minimal_dex_at(&entry.data, entry.header_offset, &descriptor)
             .with_context(|| format!("failed to extract {descriptor} from {}", entry.name))?;
         let extracted = Instant::now();
         check_cancelled(observer)?;
